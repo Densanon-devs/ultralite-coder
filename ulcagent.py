@@ -370,6 +370,31 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         examples_dir=repo_root / "data" / "augmentor_examples"
     )
 
+    # --iterate flag: scaffold-then-fill driver (engine/iterative_scaffold.py)
+    # for tasks that hit the 14B's per-tool-call content-size ceiling on
+    # large file generation. EXPERIMENTAL — branch experiment/iterative-scaffold.
+    iterate_mode = "--iterate" in sys.argv
+
+    if iterate_mode:
+        from engine.iterative_scaffold import IterativeScaffoldDriver
+        agent = IterativeScaffoldDriver(
+            model=mgr.bm,
+            registry=registry,
+            system_prompt_extra=workspace_hint,
+            workspace_root=workspace,
+            memory=memory,
+            max_scaffold_iterations=8,
+            max_fill_iterations_per_todo=6,
+            max_total_fills=25,
+            max_wall_time=900.0,
+            max_tokens_per_turn=int(cfg_max) if cfg_max else 1024,
+            temperature=cfg_temp if cfg_temp is not None else 0.1,
+            confirm_risky=_confirm_risky,
+            augment_for_goal=augment_for_goal,
+            on_event=_on_event,
+        )
+        return agent
+
     agent = Agent(
         model=mgr.bm,
         registry=registry,
@@ -1546,6 +1571,11 @@ _HELP_TEXT = """
     --new-engagement NAME
                     Scaffold a new engagement workspace (scope/, evidence/,
                     findings/, tools/, audit/, report/) and exit.
+    --iterate       EXPERIMENTAL: use scaffold-then-fill driver for
+                    large-file builds. Phase 1 emits a small skeleton with
+                    # TODO[N] markers; Phase 2 fills each TODO via fresh
+                    sub-agents. Sidesteps the 14B JSON tool-call size
+                    ceiling. Branch: experiment/iterative-scaffold.
 """
 
 
