@@ -144,6 +144,30 @@ def _read_file(ws: Workspace, path: str, offset: int = 0, limit: int = _MAX_READ
     return out
 
 
+def _coerce_text(val) -> str:
+    """Polymorphic content coercion shared by write_file and edit_file.
+
+    - None -> ""
+    - list of strings -> joined with "\\n" (the array-form escape hatch
+      that sidesteps JSON quote-escape hell on multi-line content)
+    - anything else -> str(val)
+
+    Used for write_file's `content` and edit_file's `new_string`/`old_string`
+    so the model's "use array form" reflex (taught by self_heal's PARSE_ERROR
+    hint) works consistently across both tools.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        lines = [str(x) if x is not None else "" for x in val]
+        s = "\n".join(lines)
+        if lines and lines[-1] != "":
+            if s and not s.endswith("\n"):
+                s += "\n"
+        return s
+    return str(val)
+
+
 def _write_file(ws: Workspace, path: str, content=None, new_string=None, **_ignored) -> str:
     """Write the whole file.
 
@@ -165,20 +189,8 @@ def _write_file(ws: Workspace, path: str, content=None, new_string=None, **_igno
     p = ws.resolve(path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    def _coerce(val) -> str:
-        if val is None:
-            return ""
-        if isinstance(val, list):
-            lines = [str(x) if x is not None else "" for x in val]
-            s = "\n".join(lines)
-            if lines and lines[-1] != "":
-                if s and not s.endswith("\n"):
-                    s += "\n"
-            return s
-        return str(val)
-
-    content_str = _coerce(content)
-    extra = _coerce(new_string)
+    content_str = _coerce_text(content)
+    extra = _coerce_text(new_string)
     if extra:
         # Merge content + new_string — the model's mental model of "content
         # goes first, new_string goes after" is the most common intent.
@@ -207,6 +219,30 @@ def _edit_file(
     new_string: str,
     replace_all: bool = False,
 ) -> str:
+    # `new_string` must be a plain string (use \\n for newlines), NOT an
+    # array. Unlike write_file's `content` — where each array element is a
+    # full FILE line — an edit_file `new_string` replaces a fragment that's
+    # usually indented, and the model reliably forgets to put the leading
+    # indentation in array elements (it thinks "lines of the body", not
+    # "lines of the file"), producing unindented code where indented code
+    # belongs → IndentationError. So if the model passes an array, raise a
+    # clear error directing it to use a string. (Tried accepting arrays
+    # here 2026-05-11; it broke all 4 iterative-scaffold tasks with
+    # indentation errors. Reverted.)
+    if isinstance(new_string, list) or isinstance(old_string, list):
+        raise ValueError(
+            "edit_file's old_string/new_string must be plain strings (use "
+            "\\n for newlines), not arrays. The array-of-lines form is only "
+            "for write_file's `content`. For edit_file, write the replacement "
+            "as a single string with the correct indentation baked in — e.g. "
+            'new_string="    x = 1\\n    return x" (note the 4-space indent on '
+            "each line if you're inside a function body)."
+        )
+    if old_string is None:
+        old_string = ""
+    if new_string is None:
+        new_string = ""
+
     p = ws.resolve(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {path}")
@@ -854,14 +890,18 @@ def build_default_registry(
         name="edit_file",
         description=(
             "Replace old_string with new_string in a file. old_string must match exactly. "
-            "Fails if old_string appears multiple times unless replace_all=true."
+            "Fails if old_string appears multiple times unless replace_all=true. "
+            "new_string and old_string are PLAIN STRINGS (use \\n for newlines) — "
+            "NOT arrays. (The array-of-lines form is only for write_file's content.) "
+            "When replacing an indented block, bake the indentation into new_string: "
+            'e.g. new_string="    x = 1\\n    return x" for code inside a function.'
         ),
         parameters={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path"},
                 "old_string": {"type": "string", "description": "Exact text to find"},
-                "new_string": {"type": "string", "description": "Replacement text"},
+                "new_string": {"type": "string", "description": "Replacement text (string, \\n for newlines, indentation baked in)"},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence", "default": False},
             },
             "required": ["path", "old_string", "new_string"],

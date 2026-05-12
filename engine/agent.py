@@ -882,10 +882,29 @@ class Agent:
                 elif isinstance(sub, (ast.Global, ast.Nonlocal)):
                     for name in sub.names:
                         locals_here.add(name)
-                elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                    # nested function: bind its name locally (if any) and skip its body
+                elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # nested function: bind its name locally
                     if hasattr(sub, "name"):
                         locals_here.add(sub.name)
+                elif isinstance(sub, ast.Lambda):
+                    # Lambda parameters are local to the lambda body. We do a
+                    # flat walk (not scope-aware), so the safe approximation is
+                    # to add the lambda's params to the enclosing function's
+                    # locals — slightly over-permissive (a name shadowed only
+                    # inside the lambda won't be flagged elsewhere) but it kills
+                    # the false positive on `key=lambda x: x['foo']`, which
+                    # otherwise flags `x` as undefined and derails the model
+                    # into "fixing" a non-bug. False negatives over false
+                    # positives, per this checker's design.
+                    largs = getattr(sub, "args", None)
+                    if largs is not None:
+                        for a in (list(largs.args) + list(largs.kwonlyargs)
+                                  + list(largs.posonlyargs or [])):
+                            locals_here.add(a.arg)
+                        if largs.vararg is not None:
+                            locals_here.add(largs.vararg.arg)
+                        if largs.kwarg is not None:
+                            locals_here.add(largs.kwarg.arg)
             # If function body has any star import, skip undefined-name
             # reporting for this function — we can't know what names exist.
             if "__STAR_IMPORT__" in locals_here:
