@@ -805,6 +805,26 @@ def web_research_pattern_hint() -> str:
     return _WEB_RESEARCH_PATTERN_HINT
 
 
+def mission_state_hint(workspace_root: Path | str) -> str:
+    """Return the current mission's summary as a system_prompt_extra block,
+    or "" if there's no mission file in the workspace.
+
+    Callers append this to their workspace hint so a fresh agent run picks
+    up an in-progress mission. The block is small (a goal + numbered steps +
+    a handful of notes) so context compaction never elides it. See
+    engine/mission.py.
+    """
+    try:
+        from engine.mission import Mission
+        m = Mission.load(workspace_root)
+        if m is None:
+            return ""
+        return m.render_summary(for_system_prompt=True)
+    except Exception as exc:  # never let a bad mission file block the run
+        logger.warning(f"mission_state_hint failed ({exc!r}); skipping")
+        return ""
+
+
 def build_default_registry(
     workspace_root: Path | str,
     memory: Optional[AgentMemory] = None,
@@ -813,6 +833,7 @@ def build_default_registry(
     mcp_servers: Optional[list[str]] = None,
     mcp_tool_pack: Optional[list[str]] = None,
     enable_web: bool = False,
+    enable_mission: bool = False,
 ) -> ToolRegistry:
     """
     Build a ToolRegistry pre-populated with the 8 core Phase 14 agent tools,
@@ -1076,6 +1097,123 @@ def build_default_registry(
         function=lambda action, items=None, id=None: _plan(action, items, id),
         category="planning",
     ))
+
+    # ── mission: durable multi-step state (opt-in via enable_mission) ──
+    # Unlike `plan` (in-run only), a mission persists to
+    # <workspace>/.ulcagent_mission.json and survives across runs +
+    # context compaction. The agent's system prompt carries the mission
+    # summary (injected by ulcagent via mission_state_hint), so a fresh
+    # run resumes from the file. See engine/mission.py.
+    if enable_mission:
+        from engine.mission import Mission
+
+        def _mission(action, goal=None, steps=None, n=None,
+                     title=None, text=None, note=None):  # noqa: A002
+            action = (action or "").strip().lower()
+            ws_root = ws.root
+
+            if action == "start":
+                if not goal or not str(goal).strip():
+                    raise ValueError("action='start' requires goal=<text>")
+                m = Mission(goal=str(goal).strip())
+                if steps:
+                    if not isinstance(steps, list):
+                        raise ValueError("steps must be a list of step-title strings")
+                    m.set_steps(steps)
+                m.save(ws_root)
+                return ("Mission started.\n" + m.render_summary())
+
+            # All other actions need an existing mission.
+            m = Mission.load(ws_root)
+            if m is None:
+                raise ValueError(
+                    "no mission yet — call mission(action=\"start\", goal=..., "
+                    "steps=[...]) first"
+                )
+
+            if action == "status":
+                return m.render_summary()
+
+            if action == "step_done":
+                try:
+                    idx = int(n) if n is not None else None
+                except (TypeError, ValueError):
+                    raise ValueError(f"action='step_done' requires n=<int>; got {n!r}")
+                if idx is None:
+                    raise ValueError("action='step_done' requires n=<int>")
+                m.mark_step_done(idx, note=str(note).strip() if note else "")
+                m.save(ws_root)
+                done, total = m.progress
+                tail = " — MISSION COMPLETE" if m.is_complete else ""
+                return (f"Marked step {idx} done ({done}/{total}){tail}.\n"
+                        + m.render_summary())
+
+            if action == "add_step":
+                if not title or not str(title).strip():
+                    raise ValueError("action='add_step' requires title=<text>")
+                new_n = m.add_step(str(title).strip())
+                m.save(ws_root)
+                return (f"Added step {new_n}: {str(title).strip()}\n" + m.render_summary())
+
+            if action == "note":
+                if not text or not str(text).strip():
+                    raise ValueError("action='note' requires text=<text>")
+                m.add_note(str(text).strip())
+                m.save(ws_root)
+                return f"Note recorded. {len(m.notes)} note(s) on the mission."
+
+            if action == "next":
+                m.set_next(str(text).strip() if text else "")
+                m.save(ws_root)
+                return f"Next action set to: {m.next_action or '(cleared)'}"
+
+            raise ValueError(
+                f"unknown action={action!r}. Valid: 'start' (goal=, steps=), "
+                "'status', 'step_done' (n=, note=), 'add_step' (title=), "
+                "'note' (text=), 'next' (text=)."
+            )
+
+        reg.register(ToolSchema(
+            name="mission",
+            description=(
+                "Durable multi-step mission state — survives across runs and "
+                "context compaction (persisted to .ulcagent_mission.json). Use "
+                "for long tasks with many steps. Start once: "
+                "mission(action=\"start\", goal=\"...\", steps=[\"step 1\", \"step 2\", ...]). "
+                "After finishing each step: mission(action=\"step_done\", n=N, note=\"what happened\"). "
+                "Record decisions/gotchas as you learn them: mission(action=\"note\", text=\"...\"). "
+                "Set what's next: mission(action=\"next\", text=\"...\"). "
+                "Add a step you didn't foresee: mission(action=\"add_step\", title=\"...\"). "
+                "Check state: mission(action=\"status\"). If you're resuming, the "
+                "mission summary is already in your system prompt — keep it "
+                "updated so the next session continues from where you stop."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "status", "step_done", "add_step", "note", "next"],
+                        "description": "What to do with the mission",
+                    },
+                    "goal": {"type": "string", "description": "Only for action='start': the mission objective"},
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Only for action='start': ordered list of step titles",
+                    },
+                    "n": {"type": "integer", "description": "Only for action='step_done': which step number"},
+                    "title": {"type": "string", "description": "Only for action='add_step': the new step's title"},
+                    "text": {"type": "string", "description": "For action='note' (the note) or action='next' (the next-action text)"},
+                    "note": {"type": "string", "description": "Only for action='step_done': optional brief note about how the step went"},
+                },
+                "required": ["action"],
+            },
+            function=lambda action, goal=None, steps=None, n=None, title=None, text=None, note=None: _mission(
+                action, goal=goal, steps=steps, n=n, title=title, text=text, note=note
+            ),
+            category="planning",
+        ))
 
     if ask_user_fn is not None:
         reg.register(ToolSchema(

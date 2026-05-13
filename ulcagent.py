@@ -261,6 +261,12 @@ def _build_agent(mgr: ModelManager, workspace: Path):
     extended = "--extended" in sys.argv
     enable_web = "--web" in sys.argv
     auto_yes = "--yes" in sys.argv
+    # Mission tracking: explicit via --mission, OR auto-engage if a mission
+    # file already exists in the workspace (so resuming "just works" even
+    # without the flag). When engaged, the `mission` tool is registered AND
+    # the current mission summary is injected into the system prompt below.
+    from engine.mission import Mission as _Mission
+    enable_mission = ("--mission" in sys.argv) or _Mission.exists(workspace)
 
     # Auto-engage audit logging when workspace is an engagement scaffold
     # (has an audit/ subdir). No-op for ad-hoc workspaces.
@@ -275,6 +281,7 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         extended_tools=extended,
         mcp_servers=mcp_servers,
         enable_web=enable_web,
+        enable_mission=enable_mission,
     )
 
     # Add system tools for the general profile
@@ -358,6 +365,24 @@ def _build_agent(mgr: ModelManager, workspace: Path):
     if enable_web:
         from engine.agent_builtins import web_research_pattern_hint
         workspace_hint = workspace_hint + "\n\n" + web_research_pattern_hint()
+    if enable_mission:
+        # If a mission file exists, inject its summary so the agent resumes.
+        # If --mission was passed but no file yet, inject a short prompt to
+        # start one. Either way the `mission` tool is registered (above).
+        from engine.agent_builtins import mission_state_hint
+        _ms = mission_state_hint(workspace)
+        if _ms:
+            workspace_hint = workspace_hint + "\n\n" + _ms
+        else:
+            workspace_hint = workspace_hint + (
+                "\n\n## Mission tracking enabled\n"
+                "For multi-step work, call mission(action=\"start\", "
+                "goal=\"...\", steps=[...]) at the outset, then "
+                "mission(action=\"step_done\", n=N, note=\"...\") after each "
+                "step and mission(action=\"note\", text=\"...\") for decisions. "
+                "It persists to .ulcagent_mission.json — if you run out of "
+                "context or get interrupted, the next session resumes from it."
+            )
 
     # Per-goal augmentor injection (security/, agentic/web_research_to_file/,
     # etc). Lightweight keyword matching — no embedder, no HF init. Fires
@@ -1546,6 +1571,10 @@ _HELP_TEXT = """
     --new-engagement NAME
                     Scaffold a new engagement workspace (scope/, evidence/,
                     findings/, tools/, audit/, report/) and exit.
+    --mission       Enable the `mission` tool — durable multi-step state in
+                    .ulcagent_mission.json that survives across runs and
+                    context compaction. Auto-engages if that file already
+                    exists (so resuming a mission "just works").
 """
 
 
