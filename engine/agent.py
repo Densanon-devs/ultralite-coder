@@ -192,6 +192,16 @@ class Agent:
         # 41/42 baseline if the 14B over-indexes on the new hint instead
         # of its own plan. Opt-in for the operator to A/B (Task A3, 2026-05-19).
         suggest_run_tests_on_test_edit: bool = False,
+        # Composes A1 + C4 (2026-05-19). When parse-with-errors returns
+        # only errors (no valid tool calls), and `grammar` is set, and
+        # this flag is True, the agent re-samples ONCE with the grammar
+        # attached. Forces a structurally-valid tool_call on the retry.
+        # Default OFF — same regression-risk reason as A1 (over-constraining
+        # the model can hurt the prose-final-answer flow). Cost: at most
+        # one extra model.generate() call per iteration, and only when
+        # the first-pass parse already failed (rare — <5% of turns).
+        grammar=None,
+        retry_with_grammar_on_parse_fail: bool = False,
         enable_goal_token_sweep: bool = True,
         require_mutating_action: bool = False,
         # Live self_heal diagnose-and-repair injection on consecutive
@@ -264,6 +274,8 @@ class Agent:
         self.memory = memory
         self.auto_verify_python = auto_verify_python
         self.suggest_run_tests_on_test_edit = suggest_run_tests_on_test_edit
+        self.grammar = grammar
+        self.retry_with_grammar_on_parse_fail = retry_with_grammar_on_parse_fail
         self.enable_goal_token_sweep = bool(enable_goal_token_sweep)
         self.require_mutating_action = bool(require_mutating_action)
         self.enable_self_heal = bool(enable_self_heal)
@@ -2123,6 +2135,43 @@ class Agent:
             self._emit(AgentEvent("model_text", iteration, response))
 
             calls, parse_errors = self.registry.parse_with_errors(response)
+
+            # C4 + A1 compose: if first-pass parsing produced only errors
+            # (no valid calls) AND we have a grammar wired AND the operator
+            # opted in, re-sample ONCE with the grammar attached. This
+            # forces the next response to be a structurally-valid
+            # <tool_call> JSON block. Cost: one extra model.generate() per
+            # iteration, only on the iterations that would have failed
+            # parsing anyway. Default-off (both knobs).
+            if (
+                not calls
+                and parse_errors
+                and self.retry_with_grammar_on_parse_fail
+                and self.grammar is not None
+            ):
+                try:
+                    retry_kwargs = dict(gen_kwargs)
+                    retry_kwargs["grammar"] = self.grammar
+                    retry_response = self.model.generate(prompt, **retry_kwargs)
+                except Exception as exc:
+                    logger.warning(
+                        "Grammar-guided retry failed: %s. Falling through to "
+                        "the original parse_errors handling.", exc,
+                    )
+                    retry_response = None
+                if retry_response:
+                    retry_response = retry_response.strip()
+                    retry_calls, retry_errors = self.registry.parse_with_errors(
+                        retry_response
+                    )
+                    if retry_calls:
+                        self._emit(AgentEvent(
+                            "model_text", iteration,
+                            f"[grammar-retry] {retry_response}",
+                        ))
+                        response = retry_response
+                        calls = retry_calls
+                        parse_errors = retry_errors
 
             # Mid-thought truncation detector for R1-distill-style reasoning
             # models: if the response contains `<think>` with no matching
