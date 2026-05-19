@@ -595,6 +595,12 @@ class ToolRegistry:
         # registry per task run.
         self._gate_config = None  # type: ignore[assignment]
         self._gate_state = None  # type: ignore[assignment]
+        # PostToolUse-style sanitizer (Task 5, 2026-05-19). Default-on,
+        # narrow scope (lone surrogate strip + control-char escape +
+        # 30k-char soft cap). Per-registry instance; opt out by setting
+        # self._sanitizer_config.enabled = False.
+        from engine.post_tool_sanitize import SanitizerConfig
+        self._sanitizer_config = SanitizerConfig()
 
     def configure_gate(self, config, goal_text: str = "") -> None:
         """Engage the G-STEP confidence gate for this registry.
@@ -706,6 +712,16 @@ class ToolRegistry:
             )
         try:
             result = tool.function(**call.arguments)
+            # PostToolUse sanitization (Task 5, 2026-05-19). Cleans lone
+            # surrogates + control chars and soft-truncates oversized
+            # content before the result gets serialized for the next
+            # model turn. Idempotent and skipped for tools in the
+            # opt-out set (e.g. auto_verify). See engine/post_tool_sanitize.py.
+            if self._sanitizer_config is not None and self._sanitizer_config.enabled:
+                from engine.post_tool_sanitize import sanitize_tool_result
+                result = sanitize_tool_result(
+                    call.name, result, self._sanitizer_config
+                )
             return ToolResult(name=call.name, success=True, content=result)
         except TypeError as exc:
             # Signature mismatch the validator missed (e.g. unknown kwarg
