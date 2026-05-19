@@ -115,6 +115,42 @@ class BaseModel:
             # on very long multi-turn sessions. Callers can enable manually via:
             #   from llama_cpp import LlamaRAMCache
             #   bm.model.set_cache(LlamaRAMCache(capacity_bytes=2*1024**3))
+            #
+            # Append-only KV reuse — Task B4 (2026-05-19), documented and
+            # deferred. The 2026-05-19 research synthesis identifies a 15-40%
+            # per-turn latency reduction available IF we bypass Llama.reset()
+            # between turns and feed only the new-suffix tokens into eval()
+            # while llama.cpp retains the prefix's KV cache from the prior
+            # turn.
+            #
+            # WHY NOT YET SHIPPED:
+            # 1. llama-cpp-python 0.3.20 does NOT expose `n_keep` or
+            #    `cache_prompt` in its high-level Llama() / create_completion()
+            #    API. The path requires bypassing create_completion entirely
+            #    and calling .eval() + .sample_with_kwargs() manually with
+            #    token-level prompt construction.
+            # 2. That refactor loses the streaming, stop-sequence handling,
+            #    grammar=, and repeat_penalty wiring the current generate()
+            #    path provides — all would need re-implementation.
+            # 3. engine.agent.Agent.prefix_hash() (shipped Task A2 today) is
+            #    the cache-key derivation hook B4 will consume. The Agent's
+            #    prefix byte-stability is already proven by
+            #    test_prompt_stability.py — prerequisite work is done.
+            # 4. Cannot validate the wall-clock win autonomously — needs a
+            #    real bench against Qwen 2.5 Coder 14B Q4_K_M on RTX 3060.
+            #    Same risk class as B3 (paired-GGUF draft model).
+            #
+            # IMPLEMENTATION SKETCH for the operator (when GPU time is
+            # available to validate):
+            #   - Add `BaseModel.generate_appendonly(prefix_hash, new_tokens,
+            #     ...)` that on cache_key match calls eval(new_tokens) only,
+            #     on mismatch resets + eval(full).
+            #   - Track current prefix_hash in BaseModel; pass through from
+            #     Agent.run() via Agent.prefix_hash().
+            #   - Validation: re-bench rename_function (the documented
+            #     100s→87s regression case). If B4 produces faster than
+            #     baseline on multi-turn agent runs, the suffix-only path is
+            #     delivering. If not, drop to the C++ llama.cpp APIs.
 
             if self._speculative_active:
                 logger.info("Model loaded successfully (native speculative decoding active)")
