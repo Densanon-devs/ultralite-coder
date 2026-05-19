@@ -1020,26 +1020,206 @@ def _load_aliases(workspace: Path) -> dict:
 _session_log: list[dict] = []  # {"role": "user"|"agent", "content": str, "stats": str}
 
 
+_HTML_EXPORT_CSS = """
+:root { color-scheme: light dark; }
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  max-width: 920px; margin: 2rem auto; padding: 0 1rem; line-height: 1.55;
+  background: #fafafa; color: #1a1a1a;
+}
+@media (prefers-color-scheme: dark) {
+  body { background: #16161e; color: #c0caf5; }
+  pre, code { background: #1a1b26; color: #c0caf5; }
+  .sev-critical { background: #5a1d22; border-color: #f7768e; color: #ffd1d6; }
+  .sev-high     { background: #5a3722; border-color: #ff9e64; color: #ffe0c2; }
+  .sev-medium   { background: #5a5022; border-color: #e0af68; color: #ffeec2; }
+  .sev-low      { background: #1d4221; border-color: #9ece6a; color: #d6ffe2; }
+  .user-turn    { background: #1f2335; border-left-color: #7aa2f7; }
+  .stats        { color: #565f89; }
+}
+header { border-bottom: 1px solid #888; padding-bottom: 0.6rem; margin-bottom: 1rem; }
+header h1 { margin: 0; font-size: 1.25rem; }
+header .meta { font-size: 0.85rem; opacity: 0.7; }
+.user-turn {
+  border-left: 4px solid #2563eb; background: #eff6ff;
+  padding: 0.6rem 0.9rem; margin: 1rem 0 0.5rem; border-radius: 0.25rem;
+}
+.user-turn .label { font-weight: 600; font-size: 0.75rem; opacity: 0.6;
+                    text-transform: uppercase; letter-spacing: 0.05em; }
+.assistant-turn { margin: 0.4rem 0 1rem; padding-left: 0.2rem; white-space: pre-wrap; }
+.stats { font-size: 0.8rem; color: #888; font-style: italic; margin-top: 0.4rem; }
+pre, code {
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", Consolas, monospace;
+  background: #eef0f4; border-radius: 0.25rem;
+}
+pre { padding: 0.7rem 0.9rem; overflow-x: auto; }
+code { padding: 0.1rem 0.3rem; }
+pre code { padding: 0; background: none; }
+.sev {
+  display: inline-block; padding: 0.05rem 0.45rem; margin-right: 0.4rem;
+  border: 1px solid; border-radius: 0.25rem; font-size: 0.75rem;
+  font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+}
+.sev-critical { background: #ffe1e6; border-color: #c1303d; color: #6f1721; }
+.sev-high     { background: #ffe9d6; border-color: #c95a18; color: #6f3414; }
+.sev-medium   { background: #fff5d0; border-color: #b88a13; color: #6e5410; }
+.sev-low      { background: #d9f5dd; border-color: #2c8a3f; color: #14431f; }
+"""
+
+# Regex matches a severity word at the start of a paragraph or after a bullet.
+# Keeps the rest of the line as-is; we wrap the matched word in a colored chip.
+_SEV_PATTERN = re.compile(
+    r"(?im)^(\s*(?:[-*]\s+|\d+[.)]\s+)?)(critical|high|medium|low)\b[:\s-]*",
+)
+
+
+def _html_escape(s: str) -> str:
+    """Minimal HTML escape — stdlib html.escape would add quotes too."""
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _render_message_html(content: str) -> str:
+    """Render an assistant message as HTML.
+
+    - Triple-backtick fenced blocks → <pre><code>...</code></pre>
+    - Inline `code` → <code>code</code>
+    - Severity-word prefixes (critical/high/medium/low at line start, optionally
+      after a bullet) → wrapped in a colored .sev-* chip.
+    - Everything else stays as escaped plain text inside .assistant-turn,
+      which uses white-space: pre-wrap so line breaks survive.
+    """
+    out_parts: list[str] = []
+    # Split on fenced code blocks first; preserve language hint if present.
+    pieces = re.split(r"(```[^\n]*\n.*?```)", content, flags=re.DOTALL)
+    for piece in pieces:
+        if piece.startswith("```"):
+            # Drop the leading and trailing fence; first line may be a lang.
+            inner = piece[3:-3]
+            first_newline = inner.find("\n")
+            if first_newline != -1:
+                # Anything before the first newline is the lang hint.
+                inner = inner[first_newline + 1 :]
+            out_parts.append(f"<pre><code>{_html_escape(inner.rstrip())}</code></pre>")
+        else:
+            escaped = _html_escape(piece)
+            # Inline backticks.
+            escaped = re.sub(
+                r"`([^`\n]+)`", r"<code>\1</code>", escaped,
+            )
+            # Severity chips.
+            def _sev(m):
+                prefix, word = m.group(1), m.group(2).lower()
+                return f"{prefix}<span class=\"sev sev-{word}\">{word}</span> "
+            escaped = _SEV_PATTERN.sub(_sev, escaped)
+            out_parts.append(escaped)
+    return "".join(out_parts)
+
+
+def _build_session_html(workspace: Path, entries: list[dict]) -> str:
+    """Build the full HTML document for a session export."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M")
+    body_parts: list[str] = []
+    for entry in entries:
+        if entry["role"] == "user":
+            body_parts.append(
+                f'<div class="user-turn">'
+                f'<div class="label">User goal</div>'
+                f'<div>{_html_escape(entry["content"])}</div>'
+                f'</div>'
+            )
+        else:
+            rendered = _render_message_html(entry["content"])
+            body_parts.append(f'<div class="assistant-turn">{rendered}</div>')
+            if entry.get("stats"):
+                body_parts.append(
+                    f'<div class="stats">{_html_escape(entry["stats"])}</div>'
+                )
+    return (
+        '<!doctype html>\n'
+        '<html lang="en">\n'
+        '<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f'<title>ulcagent session — {timestamp}</title>\n'
+        f'<style>{_HTML_EXPORT_CSS}</style>\n'
+        '</head>\n'
+        '<body>\n'
+        '<header>\n'
+        f'<h1>ulcagent session</h1>\n'
+        f'<div class="meta">{timestamp} &middot; '
+        f'workspace: <code>{_html_escape(str(workspace))}</code> &middot; '
+        f'{len(entries)} entries</div>\n'
+        '</header>\n'
+        + "\n".join(body_parts)
+        + '\n</body>\n</html>\n'
+    )
+
+
+def _parse_export_args(args: str) -> tuple[str, Optional[str]]:
+    """Parse /export args. Returns (fname_or_empty, fmt) where fmt is
+    None | 'md' | 'html'. Accepts `--format html`, `--html`, or `.html`
+    suffix on the filename. Defaults: markdown."""
+    tokens = (args or "").split()
+    fmt: Optional[str] = None
+    fname_tokens: list[str] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in ("--html", "-html"):
+            fmt = "html"
+        elif t in ("--md", "--markdown", "-md"):
+            fmt = "md"
+        elif t == "--format" and i + 1 < len(tokens):
+            fmt = tokens[i + 1].lower()
+            i += 1
+        else:
+            fname_tokens.append(t)
+        i += 1
+    fname = " ".join(fname_tokens).strip()
+    if fmt is None and fname.lower().endswith(".html"):
+        fmt = "html"
+    return fname, fmt
+
+
 def _export_session(workspace: Path, args: str):
-    """Export session conversation to markdown."""
+    """Export session conversation to markdown or HTML.
+
+    Usage:
+        /export                       → markdown, timestamped filename
+        /export myname.md             → markdown, custom name
+        /export --html                → HTML, timestamped filename
+        /export --format html         → HTML, timestamped filename
+        /export myreport.html         → HTML inferred from suffix
+        /export --html myreview.html  → HTML, custom name
+    """
     if not _session_log:
         print(f"  {_dim('Nothing to export.')}")
         return
-    fname = args.strip() if args.strip() else f"session_{time.strftime('%Y%m%d_%H%M%S')}.md"
-    if not fname.endswith(".md"):
+    fname, fmt = _parse_export_args(args)
+    fmt = fmt or "md"
+    if not fname:
+        ext = ".html" if fmt == "html" else ".md"
+        fname = f"session_{time.strftime('%Y%m%d_%H%M%S')}{ext}"
+    if fmt == "html" and not fname.lower().endswith(".html"):
+        fname += ".html"
+    elif fmt == "md" and not fname.lower().endswith(".md"):
         fname += ".md"
     p = workspace / fname
-    lines = [f"# ulcagent session — {time.strftime('%Y-%m-%d %H:%M')}\n"]
-    lines.append(f"workspace: {workspace}\n\n---\n")
-    for entry in _session_log:
-        if entry["role"] == "user":
-            lines.append(f"\n## >>> {entry['content']}\n")
-        else:
-            lines.append(f"\n{entry['content']}\n")
-            if entry.get("stats"):
-                lines.append(f"\n*{entry['stats']}*\n")
-    p.write_text("\n".join(lines), encoding="utf-8")
-    print(f"  {_green('Exported:')} {p} ({len(_session_log)} entries)")
+
+    if fmt == "html":
+        p.write_text(_build_session_html(workspace, _session_log), encoding="utf-8")
+    else:
+        lines = [f"# ulcagent session — {time.strftime('%Y-%m-%d %H:%M')}\n"]
+        lines.append(f"workspace: {workspace}\n\n---\n")
+        for entry in _session_log:
+            if entry["role"] == "user":
+                lines.append(f"\n## >>> {entry['content']}\n")
+            else:
+                lines.append(f"\n{entry['content']}\n")
+                if entry.get("stats"):
+                    lines.append(f"\n*{entry['stats']}*\n")
+        p.write_text("\n".join(lines), encoding="utf-8")
+    print(f"  {_green('Exported:')} {p} ({len(_session_log)} entries, {fmt})")
 
 
 # ── Clipboard ────────────────────────────────────────────────────
@@ -1441,7 +1621,7 @@ _HELP_TEXT = """
     {cyan}/modelpath add <dir>{end} Add a directory to scan for GGUFs
     {cyan}/modelpath remove <dir>{end} Remove a search directory
     {cyan}/review{end}              Review uncommitted changes for bugs + security
-    {cyan}/export{end} [file]       Save session conversation to markdown
+    {cyan}/export{end} [file]       Save session to markdown ({dim}--html{end} for HTML)
     {cyan}/paste{end}               Send clipboard contents as context
     {cyan}/copy{end}                Copy last answer to clipboard
     {cyan}/snippet save <n>{end}    Save last answer as a named snippet
@@ -1553,9 +1733,9 @@ def _print_help():
     text = _HELP_TEXT
     if _USE_COLOR:
         text = text.replace("{bold}", "\033[1m").replace("{end}", "\033[0m")
-        text = text.replace("{cyan}", "\033[36m")
+        text = text.replace("{cyan}", "\033[36m").replace("{dim}", "\033[2m")
     else:
-        for tag in ("{bold}", "{end}", "{cyan}"):
+        for tag in ("{bold}", "{end}", "{cyan}", "{dim}"):
             text = text.replace(tag, "")
     print(text)
 
