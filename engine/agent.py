@@ -184,6 +184,14 @@ class Agent:
         workspace_root: Optional[Path] = None,
         memory: Optional[AgentMemory] = None,
         auto_verify_python: bool = True,
+        # When True, after a successful write/edit to a test file (path
+        # matches test_*.py or contains /tests/), the agent injects a
+        # synthetic `test_edit_hint` observation suggesting the model
+        # run_tests next. Default OFF — changing the post-edit observation
+        # stream is the same class of risk as A1/A4: it can regress the
+        # 41/42 baseline if the 14B over-indexes on the new hint instead
+        # of its own plan. Opt-in for the operator to A/B (Task A3, 2026-05-19).
+        suggest_run_tests_on_test_edit: bool = False,
         enable_goal_token_sweep: bool = True,
         require_mutating_action: bool = False,
         # Live self_heal diagnose-and-repair injection on consecutive
@@ -255,6 +263,7 @@ class Agent:
         self.workspace_root = Path(workspace_root) if workspace_root is not None else None
         self.memory = memory
         self.auto_verify_python = auto_verify_python
+        self.suggest_run_tests_on_test_edit = suggest_run_tests_on_test_edit
         self.enable_goal_token_sweep = bool(enable_goal_token_sweep)
         self.require_mutating_action = bool(require_mutating_action)
         self.enable_self_heal = bool(enable_self_heal)
@@ -521,6 +530,62 @@ class Agent:
         if ext in (".yml", ".yaml"):
             return self._verify_yaml(p)
         return None
+
+    # Path patterns that mark a file as a test. Order matters only for
+    # readability — any single match marks the file.
+    _TEST_PATH_PATTERNS = (
+        re.compile(r"(?:^|[/\\])tests?[/\\]"),       # /tests/ or /test/ directory
+        re.compile(r"(?:^|[/\\])test_[^/\\]+\.py$"),  # test_foo.py
+        re.compile(r"(?:^|[/\\])[^/\\]+_test\.py$"),  # foo_test.py
+    )
+
+    @classmethod
+    def _looks_like_test_file(cls, path: str) -> bool:
+        """True if *path* looks like a pytest/unittest target by naming
+        convention. Pure string check — no I/O. Used by the A3 hint."""
+        if not path:
+            return False
+        norm = path.replace("\\", "/")
+        return any(p.search(norm) for p in cls._TEST_PATH_PATTERNS)
+
+    def _maybe_suggest_run_tests(
+        self, call: ToolCall, result: ToolResult
+    ) -> Optional[ToolResult]:
+        """Synthetic `test_edit_hint` after a successful test-file edit
+        (Task A3, 2026-05-19). Opt-in via suggest_run_tests_on_test_edit.
+
+        Fires when:
+          1. The flag is on.
+          2. The call was write_file or edit_file.
+          3. The call succeeded.
+          4. The path looks like a test file.
+
+        Returns None otherwise. The hint is a SUGGESTION — the model
+        decides whether to act on it. We never auto-execute run_tests
+        from inside the agent loop (that would violate the model-decides
+        contract that's load-bearing for the 41/42 baseline)."""
+        if not self.suggest_run_tests_on_test_edit:
+            return None
+        if call.name not in ("write_file", "edit_file"):
+            return None
+        if not result.success:
+            return None
+        path_arg = call.arguments.get("path")
+        if not isinstance(path_arg, str):
+            return None
+        if not self._looks_like_test_file(path_arg):
+            return None
+        return ToolResult(
+            name="test_edit_hint",
+            success=True,
+            content=(
+                f"You just modified the test file {path_arg!r}. The next "
+                "step is to verify your change by calling run_tests "
+                "(preferred over run_bash for any test invocation). If "
+                "you have other edits still pending for this task, "
+                "complete them first, then call run_tests once at the end."
+            ),
+        )
 
     @staticmethod
     def _verify_python(p: Path) -> ToolResult:
@@ -2502,6 +2567,12 @@ class Agent:
                     results.append(verify)
                     self._tool_results.append(verify)
                     self._emit(AgentEvent("tool_result", iteration, verify))
+
+                test_hint = self._maybe_suggest_run_tests(call, result)
+                if test_hint is not None:
+                    results.append(test_hint)
+                    self._tool_results.append(test_hint)
+                    self._emit(AgentEvent("tool_result", iteration, test_hint))
 
             # Surface parser errors as synthetic tool results so the model
             # sees "your malformed call didn't run" and can retry with
