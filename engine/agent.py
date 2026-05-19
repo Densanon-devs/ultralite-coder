@@ -291,6 +291,16 @@ class Agent:
     # ── prompt assembly ──
 
     def _system_prompt(self) -> str:
+        # Cache-stability invariant (Task A2, 2026-05-19):
+        #   _system_prompt() MUST produce byte-identical output across iterations
+        #   of a single run() call. Every part below is set ONCE at run() start
+        #   (_goal_augmentor_block, _memory_block) or is module-level constant
+        #   (_DEFAULT_SYSTEM) or is deterministic per registry (tool_block — see
+        #   ToolRegistry.hermes_system_block which iterates dict-insertion order).
+        #   Tested by test_prompt_stability.py. If you add a part that varies
+        #   per-iteration (timestamps, random IDs, mutable state), B4's
+        #   append-only KV reuse loses its cache hit and the prompt processing
+        #   cost goes from O(suffix) back to O(prefix + suffix) per turn.
         parts = [_DEFAULT_SYSTEM.strip()]
         if self.system_prompt_extra.strip():
             parts.append(self.system_prompt_extra.strip())
@@ -302,6 +312,17 @@ class Agent:
         if tool_block:
             parts.append(tool_block)
         return "\n\n".join(parts)
+
+    def prefix_hash(self) -> str:
+        """Stable hash of the cacheable prompt prefix (system block only).
+
+        Future B4 (append-only KV) will derive cache keys from this. Returned
+        as sha256 hex so a one-byte drift surfaces as a totally different hash
+        — easy to spot in logs and easy to test against. Pure: no side effects,
+        no I/O. Safe to call every iteration.
+        """
+        import hashlib
+        return hashlib.sha256(self._system_prompt().encode("utf-8")).hexdigest()
 
     def _maybe_compact_transcript(self) -> None:
         """Keep the transcript within the configured context budget.
