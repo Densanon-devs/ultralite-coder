@@ -72,6 +72,14 @@ class BaseModel:
                 verbose=logger.isEnabledFor(logging.DEBUG),
             )
 
+            kv_kwargs = self._kv_cache_kwargs()
+            if kv_kwargs:
+                llama_kwargs.update(kv_kwargs)
+                logger.info(
+                    f"  KV cache: k={getattr(self.config, 'cache_type_k', None) or 'f16'}, "
+                    f"v={getattr(self.config, 'cache_type_v', None) or 'f16'}"
+                )
+
             draft = self._maybe_build_draft_model()
             if draft is not None:
                 llama_kwargs["draft_model"] = draft
@@ -80,7 +88,8 @@ class BaseModel:
                 self.model = Llama(**llama_kwargs)
                 self._speculative_active = draft is not None
             except TypeError as e:
-                if draft is not None and "draft_model" in str(e):
+                msg = str(e)
+                if draft is not None and "draft_model" in msg:
                     logger.warning(
                         "llama-cpp-python in this environment does not accept "
                         "draft_model kwarg. Loading without native speculative decoding."
@@ -88,6 +97,15 @@ class BaseModel:
                     llama_kwargs.pop("draft_model", None)
                     self.model = Llama(**llama_kwargs)
                     self._speculative_active = False
+                elif kv_kwargs and ("type_k" in msg or "type_v" in msg):
+                    logger.warning(
+                        "llama-cpp-python in this environment does not accept "
+                        "type_k/type_v kwargs. Loading with default F16 KV cache."
+                    )
+                    for k in ("type_k", "type_v"):
+                        llama_kwargs.pop(k, None)
+                    self.model = Llama(**llama_kwargs)
+                    self._speculative_active = draft is not None
                 else:
                     raise
 
@@ -287,6 +305,37 @@ class BaseModel:
             return len(tokens)
         except Exception:
             return len(text) // 4
+
+    # Map llama.cpp GGML quant type names to the integer constants
+    # llama-cpp-python's Llama(type_k=..., type_v=...) accepts. Values pulled
+    # from ggml.h GGML_TYPE_* enum (stable since 2024).
+    _KV_TYPE_CODES = {
+        "f32": 0,
+        "f16": 1,
+        "q4_0": 2,
+        "q4_1": 3,
+        "q5_0": 6,
+        "q5_1": 7,
+        "q8_0": 8,
+    }
+
+    def _kv_cache_kwargs(self) -> dict:
+        """Return llama-cpp-python kwargs for KV cache quant, or {} if defaults."""
+        k = getattr(self.config, "cache_type_k", None)
+        v = getattr(self.config, "cache_type_v", None)
+        out = {}
+        for name, val in (("type_k", k), ("type_v", v)):
+            if val is None:
+                continue
+            key = str(val).lower().strip()
+            if key not in self._KV_TYPE_CODES:
+                logger.warning(
+                    f"Unknown KV cache type {val!r}; ignoring (allowed: "
+                    f"{sorted(self._KV_TYPE_CODES)})"
+                )
+                continue
+            out[name] = self._KV_TYPE_CODES[key]
+        return out
 
     def _maybe_build_draft_model(self):
         """Build a native speculative draft model if configured. Never raises."""
