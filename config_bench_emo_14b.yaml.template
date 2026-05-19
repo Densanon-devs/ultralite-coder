@@ -1,0 +1,71 @@
+# Bench config template for AI2 EMO 14B-total / 1B-active MoE (Task 11, 2026-05-19).
+#
+# Rename to config_bench_emo_14b.yaml after the GGUF lands in models/.
+# Then:
+#
+#   python benchmark_agentic.py \
+#       --config config_bench_emo_14b.yaml \
+#       --repeat 3 --share-model \
+#       --output bench_emo_14b_2026-05-19.json
+#   python -m engine.bench_calibration bench_emo_14b_2026-05-19.json
+#
+# Source: project_ultralight_coder_phase14_next.md 2026-05-08 +
+# experiment_backlog WATCH (added 2026-05-08). MEDIUM-priority watch
+# item — GGUF NOT YET AVAILABLE as of 2026-05-19.
+#
+# Status check before scheduling the bench:
+#   1. Visit https://huggingface.co/collections/allenai/emo
+#   2. Verify a GGUF (Q4_K_M or better) has been published; if not,
+#      this task remains BLOCKED on upstream artifact.
+#
+# Why interesting: 1T-token training; document-level expert routing
+# (experts cluster around domains: health, news, CODE) — different
+# from per-token routing in standard MoEs. 1B active params at 14B-total
+# capacity = much faster inference than dense 14B at similar quality.
+# Document-level routing should mean the same expert stays active across
+# an entire file context, plausibly more stable on multi-file agentic
+# tasks. Fits RTX 3060 12 GB easily even at FP16.
+#
+# Bench protocol: head-to-head with current Qwen 2.5 Coder 14B baseline,
+# apply EvalEval k=5 + Bayesian calibration (engine/bench_calibration.py)
+# before declaring a winner. The 1B-active speed advantage is the
+# load-bearing argument — at similar quality, much-faster inference is
+# what would justify a daily-driver swap.
+
+system:
+  name: Ultralite Code Assistant (AI2 EMO 14B bench)
+  version: 0.1.0
+  log_level: INFO
+
+base_model:
+  # FILL IN: exact GGUF filename once published by AllenAI / community.
+  # As of 2026-05-19 no GGUF has been released — model is BF16 only.
+  path: models/emo-14b-instruct-q4_k_m.gguf
+  context_length: 16384
+  gpu_layers: 99
+  threads: 8
+  temperature: 0.1
+  max_tokens: 1024
+  batch_size: 512
+  # Default F16 KV — 1B-active means modest KV pressure, no need for
+  # Q8 unless context bloat surfaces during the run.
+  # cache_type_k: q8_0
+  # cache_type_v: q8_0
+
+augmentors:
+  enabled: true
+  mode: auto                     # 14B-total ≥ 3 GB → large-mode active
+  examples_dir: data/augmentor_examples
+  model_size_threshold: 1500
+  failure_routing: true
+
+memory:
+  enabled: true
+  short_term:
+    max_turns: 30
+    max_tokens: 2048
+
+fusion:
+  mode: lean
+  chat_format: chatml
+  max_prompt_tokens: 2048

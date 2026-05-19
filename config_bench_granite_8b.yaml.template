@@ -1,0 +1,73 @@
+# Bench config template for IBM Granite 4.1 8B Instruct (Task 10, 2026-05-19).
+#
+# Rename to config_bench_granite_8b.yaml after the GGUF lands in models/.
+# Then:
+#
+#   python benchmark_agentic.py \
+#       --config config_bench_granite_8b.yaml \
+#       --repeat 3 --share-model \
+#       --output bench_granite_8b_2026-05-19.json
+#   python -m engine.bench_calibration bench_granite_8b_2026-05-19.json
+#
+# Source: project_ultralight_coder_phase14_next.md 2026-04-30 + 2026-05-05
+# (experiment_backlog #50). MEDIUM-priority candidate — Apache 2.0, strong
+# tool-calling number (BFCL V3 = 68.27), HumanEval 87.20%, RULER 32K = 83.6.
+# 8B dense fits RTX 3060 12 GB at Q4_K_M (~4.5 GB) with comfortable KV
+# headroom; at FP8 (~8 GB) it still fits but loses budget.
+#
+# Important caveat from the 2026-05-05 entry: Simon Willison's informal
+# SVG quality test on the 3B was "all pretty terrible." Code-gen quality
+# at small quants is NOT yet independently verified beyond IBM's own
+# numbers. Apply Bayesian calibration (engine/bench_calibration.py) +
+# EvalEval k=5 protocol before declaring a winner against Qwen 2.5
+# Coder 14B baseline.
+#
+# Download URLs to verify:
+#   - https://huggingface.co/ibm-granite/granite-4.1-8b-instruct
+#   - GGUF community converter (check date — IBM's own GGUFs preferred
+#     once shipped): bartowski / unsloth typically follow within a week
+# Pin the exact filename in `path` below before running.
+#
+# Chat template caveat: Granite uses its own chat format, NOT Hermes/Qwen
+# native tool_calls. Per feedback_gemma4_rejected.md the harness's Hermes
+# parser is what enables reliable tool calling — if Granite doesn't emit
+# Hermes-format tool_calls natively, expect a meaningful regression vs
+# Qwen baseline. Run a 1-task smoke test first before committing the full
+# 13-task suite.
+
+system:
+  name: Ultralite Code Assistant (Granite 4.1 8B bench)
+  version: 0.1.0
+  log_level: INFO
+
+base_model:
+  # FILL IN: exact GGUF filename once downloaded
+  path: models/granite-4.1-8b-instruct-q4_k_m.gguf
+  context_length: 16384
+  gpu_layers: 99
+  threads: 8
+  temperature: 0.1
+  max_tokens: 1024
+  batch_size: 512
+  # KV-Q8 optional — 8 GB model leaves headroom. Default F16 first to
+  # rule out KV-quant as a quality confounder when comparing to baseline.
+  # cache_type_k: q8_0
+  # cache_type_v: q8_0
+
+augmentors:
+  enabled: true
+  mode: auto                     # 8 GB ≥ 3 GB → large-mode active
+  examples_dir: data/augmentor_examples
+  model_size_threshold: 1500
+  failure_routing: true
+
+memory:
+  enabled: true
+  short_term:
+    max_turns: 30
+    max_tokens: 2048
+
+fusion:
+  mode: lean
+  chat_format: chatml
+  max_prompt_tokens: 2048
