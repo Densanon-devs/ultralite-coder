@@ -75,6 +75,12 @@ class AgentResult:
     transcript: list[dict[str, str]] = field(default_factory=list)
     compactions: int = 0  # how many context-compaction passes fired during this run
     self_heals: int = 0   # how many live diagnose-and-repair injections fired
+    # G-STEP gate observability (Task 7, 2026-05-19). Dict shape from
+    # engine.tool_gate.GateStats.summary(). Empty when the gate's stats
+    # are unreachable (e.g., registry created outside Agent). The Agent
+    # exposes this so benchmark_agentic.py can include it in the JSON
+    # output without needing a separate channel.
+    gate_stats: dict = field(default_factory=dict)
 
 
 # ── System prompt ───────────────────────────────────────────────
@@ -2535,6 +2541,17 @@ class Agent:
         wall = time.monotonic() - start
         self._emit(AgentEvent("stopped", iteration, stop_reason))
 
+        # Extract G-STEP gate observability if the registry has it.
+        gate_stats: dict = {}
+        try:
+            gs = getattr(self.registry, "_gate_state", None)
+            if gs is not None:
+                stats = getattr(gs, "stats", None)
+                if stats is not None and hasattr(stats, "summary"):
+                    gate_stats = stats.summary()
+        except Exception:
+            gate_stats = {}
+
         return AgentResult(
             final_answer=final_answer,
             iterations=iteration,
@@ -2545,6 +2562,7 @@ class Agent:
             transcript=list(self._transcript),
             compactions=self._compactions,
             self_heals=self._self_heal_fired,
+            gate_stats=gate_stats,
         )
 
 

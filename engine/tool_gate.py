@@ -86,6 +86,86 @@ class ToolGateConfig:
 
 
 @dataclass
+class GateStats:
+    """Observability counters for the G-STEP gate (Task 7, 2026-05-19).
+
+    Without this, the gate is a black box at runtime. Per the 2026-05-04
+    integration arc, the gate shipped on master without any way to tell if
+    it ever fires on real runs. The stats here let an operator post-run
+    answer:
+
+      - did the gate fire at all?
+      - which mode (anchor vs exploration cap)?
+      - how often did it bypass action tools without checking?
+
+    Counters are pure, monotonically non-decreasing within a run. The
+    GateState owns one instance.
+    """
+
+    # How many times check() was called.
+    checks: int = 0
+    # How many calls were allowed (allow=True). Always >= checks - rejected*.
+    allowed: int = 0
+    # Allow paths broken down:
+    allowed_disabled: int = 0      # config.enabled was False (no-op)
+    allowed_action_tool: int = 0   # bypassed because tool is in ACTION_TOOLS
+    allowed_anchor_ok: int = 0     # exploration call passed both gate checks
+    allowed_no_key_arg: int = 0    # tool has no key argument to anchor-check
+    # Reject paths broken down:
+    rejected_anchor: int = 0       # key arg has no lexical anchor in corpus
+    rejected_exploration_cap: int = 0  # hit consecutive_exploration cap
+
+    # Per-tool fire counts (rejected only). Useful for finding which tool
+    # the gate is correcting on a real run.
+    rejected_by_tool: dict[str, int] = field(default_factory=dict)
+
+    def record_allow(self, kind: str) -> None:
+        self.allowed += 1
+        attr = f"allowed_{kind}"
+        if hasattr(self, attr):
+            setattr(self, attr, getattr(self, attr) + 1)
+
+    def record_reject(self, tool_name: str, kind: str) -> None:
+        attr = f"rejected_{kind}"
+        if hasattr(self, attr):
+            setattr(self, attr, getattr(self, attr) + 1)
+        self.rejected_by_tool[tool_name] = self.rejected_by_tool.get(tool_name, 0) + 1
+
+    @property
+    def total_rejected(self) -> int:
+        return self.rejected_anchor + self.rejected_exploration_cap
+
+    @property
+    def fire_rate(self) -> float:
+        """Fraction of non-disabled, non-action-tool checks the gate
+        rejected. This is the operationally interesting number — if the
+        gate is enabled but only checks action tools (or runs on configs
+        where it's disabled), fire_rate is 0 and you know it's dead code
+        on this stack."""
+        considered = self.checks - self.allowed_disabled - self.allowed_action_tool
+        if considered <= 0:
+            return 0.0
+        return self.total_rejected / considered
+
+    def summary(self) -> dict:
+        """Render to a JSON-serializable dict for inclusion in
+        AgentResult / benchmark JSON output."""
+        return {
+            "checks": self.checks,
+            "allowed": self.allowed,
+            "allowed_disabled": self.allowed_disabled,
+            "allowed_action_tool": self.allowed_action_tool,
+            "allowed_anchor_ok": self.allowed_anchor_ok,
+            "allowed_no_key_arg": self.allowed_no_key_arg,
+            "rejected_anchor": self.rejected_anchor,
+            "rejected_exploration_cap": self.rejected_exploration_cap,
+            "total_rejected": self.total_rejected,
+            "fire_rate": round(self.fire_rate, 4),
+            "rejected_by_tool": dict(self.rejected_by_tool),
+        }
+
+
+@dataclass
 class GateState:
     """Mutable per-run state. The Agent owns one instance per task run."""
 
@@ -93,6 +173,9 @@ class GateState:
     # Lowercase concatenation of the goal text + every prior tool
     # result. The gate checks tool args against this corpus.
     seen_corpus: str = ""
+    # Observability counters. Always present so callers can read
+    # state.stats without a None check.
+    stats: GateStats = field(default_factory=GateStats)
 
     def record_observation(self, text: str) -> None:
         """Append a tool result (or any prior observation) to the seen
@@ -191,12 +274,16 @@ def check(
     config: ToolGateConfig,
 ) -> GateDecision:
     """The single entry point. Cheap, no I/O, no model calls."""
+    state.stats.checks += 1
+
     if not config.enabled:
+        state.stats.record_allow("disabled")
         return GateDecision(allow=True)
 
     # Action tools are never gated — the gate is about suppressing
     # *unproductive* exploration, not blocking progress.
     if tool_name in ACTION_TOOLS:
+        state.stats.record_allow("action_tool")
         return GateDecision(allow=True)
 
     # Cap consecutive exploration. Off-by-one note: the call we're
@@ -206,6 +293,7 @@ def check(
         tool_name in EXPLORATION_TOOLS
         and state.consecutive_exploration >= config.max_consecutive_exploration
     ):
+        state.stats.record_reject(tool_name, "exploration_cap")
         return GateDecision(
             allow=False,
             reason=(
@@ -221,6 +309,7 @@ def check(
     key_arg = _key_argument(tool_name, arguments)
     if key_arg is not None and isinstance(key_arg, str):
         if not _has_lexical_anchor(key_arg, state.seen_corpus, config.min_anchor_length):
+            state.stats.record_reject(tool_name, "anchor")
             return GateDecision(
                 allow=False,
                 reason=(
@@ -231,5 +320,8 @@ def check(
                     "workspace before guessing at a path."
                 ),
             )
+        state.stats.record_allow("anchor_ok")
+    else:
+        state.stats.record_allow("no_key_arg")
 
     return GateDecision(allow=True)
