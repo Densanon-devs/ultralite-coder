@@ -573,6 +573,53 @@ def strip_tool_calls(text: str) -> str:
     return _TOOL_CALL_RE.sub("", text).strip()
 
 
+# ── Tool pruning helpers (Task A4, 2026-05-19) ──────────────────
+
+
+# Stopwords excluded from scoring so common English filler doesn't drown
+# out signal. Intentionally short — anything not in here counts as a real
+# token. Tokens shorter than 3 chars are also dropped.
+_PRUNE_STOPWORDS: frozenset = frozenset({
+    "the", "and", "for", "with", "from", "into", "that", "this", "these",
+    "those", "have", "has", "had", "are", "was", "were", "been", "being",
+    "you", "your", "our", "their", "his", "her", "its", "any", "all", "every",
+    "but", "not", "can", "could", "would", "should", "will", "shall",
+    "use", "using", "used", "do", "does", "doing", "make", "made",
+    "be", "is", "of", "to", "in", "on", "at", "by", "as", "or",
+    # Common task verbs that match every tool — too generic to score.
+    "tool", "tools", "file", "files", "code", "function", "functions",
+})
+
+
+def _tokenize_for_pruning(text: str) -> set[str]:
+    """Lowercase + word-split + filter for relevance scoring. Deterministic."""
+    if not text:
+        return set()
+    tokens = re.findall(r"[a-z0-9_]{3,}", text.lower())
+    return {t for t in tokens if t not in _PRUNE_STOPWORDS}
+
+
+def _score_tool_against_goal(tool, goal_tokens: set[str]) -> int:
+    """Lexical overlap score between *tool* and *goal_tokens*. Higher is more
+    relevant. Score = number of distinct goal tokens that appear in the
+    tool's (name + description + parameter property names) corpus."""
+    if not goal_tokens:
+        return 0
+    parts = [tool.name, tool.description]
+    params = tool.parameters or {}
+    props = params.get("properties") or {}
+    parts.extend(props.keys())
+    # Also include property descriptions if present — they leak signal
+    # about what the parameter is for ("regex pattern", "absolute path", etc.)
+    for prop_schema in props.values():
+        if isinstance(prop_schema, dict):
+            desc = prop_schema.get("description") or ""
+            if desc:
+                parts.append(desc)
+    haystack = _tokenize_for_pruning(" ".join(parts))
+    return len(goal_tokens & haystack)
+
+
 # ── Registry ────────────────────────────────────────────────────
 
 
@@ -631,16 +678,85 @@ class ToolRegistry:
     def enabled_tools(self) -> list[ToolSchema]:
         return [t for t in self._tools.values() if t.enabled]
 
+    # Lean floor set — tools that must ALWAYS appear in the system block
+    # regardless of goal-similarity pruning. These are the core file +
+    # exploration + execution surface; without them the model can't make
+    # progress on any task.
+    DEFAULT_FLOOR_SET: frozenset = frozenset({
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "glob",
+        "grep",
+        "run_tests",
+        "run_bash",
+    })
+
+    def enabled_tools_for_goal(
+        self,
+        goal: str,
+        k: int = 10,
+        floor_set: Optional[frozenset] = None,
+    ) -> list[ToolSchema]:
+        """Return the top-k tools most relevant to *goal*, plus the floor set.
+
+        Per Phase 14 next-steps research (ToolRet ACL 2025, AutoTool Nov 2025):
+        pruning the tool set to ~6-10 goal-relevant entries beats full-schema
+        injection on small models. ULC's tool-count regression
+        (feedback_tool_count_regression.md) confirms the same trend: 21 tools
+        drop the 14B from 97.6% to 85.7%.
+
+        Scoring is intentionally simple — no embedding model, no GPU
+        contention. Lexical token-overlap against tool name + description +
+        parameter property names. Cheap, deterministic, fast (<1ms even
+        with hundreds of tools).
+
+        The floor set is ALWAYS included — these are the eight tools without
+        which the agent can't navigate or modify the workspace. Override via
+        floor_set= to customize.
+
+        Returns tools in: floor-set-first (in registration order), then
+        ranked extras by descending score. Stable across calls for the same
+        goal+registry (deterministic tiebreak by registration order).
+        """
+        floor = floor_set if floor_set is not None else self.DEFAULT_FLOOR_SET
+        enabled = self.enabled_tools()
+        if not enabled:
+            return []
+        # Floor first — preserve registration order.
+        floor_tools = [t for t in enabled if t.name in floor]
+        extras = [t for t in enabled if t.name not in floor]
+        if not extras:
+            return floor_tools
+        # Score extras by lexical overlap with the goal.
+        goal_tokens = _tokenize_for_pruning(goal)
+        scored = [
+            (idx, _score_tool_against_goal(t, goal_tokens), t)
+            for idx, t in enumerate(extras)
+        ]
+        # Sort: highest score first; ties broken by registration order
+        # (idx ascending) so the result is deterministic.
+        scored.sort(key=lambda x: (-x[1], x[0]))
+        remaining_slots = max(0, k - len(floor_tools))
+        kept_extras = [t for _, _, t in scored[:remaining_slots]]
+        return floor_tools + kept_extras
+
     # ── prompt generation ──
-    def hermes_system_block(self) -> str:
+    def hermes_system_block(self, tools: Optional[list[ToolSchema]] = None) -> str:
         """
         Build the exact Qwen 2.5 / Hermes tool-use system-prompt block.
 
         Qwen 2.5's chat template emits tool calls in this format natively —
         matching the format the model was trained on is what unlocks reliable
         tool calling from the 14B without custom parsing gymnastics.
+
+        Pass an explicit *tools* list (e.g. from enabled_tools_for_goal())
+        to render a pruned block. Default behavior (tools=None) renders the
+        full enabled set, preserving the pre-A4 baseline.
         """
-        tools = self.enabled_tools()
+        if tools is None:
+            tools = self.enabled_tools()
         if not tools:
             return ""
         tool_lines = [json.dumps(t.to_hermes_dict(), ensure_ascii=False) for t in tools]
