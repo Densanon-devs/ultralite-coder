@@ -184,14 +184,18 @@ class Agent:
         workspace_root: Optional[Path] = None,
         memory: Optional[AgentMemory] = None,
         auto_verify_python: bool = True,
-        # When True, after a successful write/edit to a test file (path
-        # matches test_*.py or contains /tests/), the agent injects a
-        # synthetic `test_edit_hint` observation suggesting the model
-        # run_tests next. Default OFF — changing the post-edit observation
-        # stream is the same class of risk as A1/A4: it can regress the
-        # 41/42 baseline if the 14B over-indexes on the new hint instead
-        # of its own plan. Opt-in for the operator to A/B (Task A3, 2026-05-19).
-        suggest_run_tests_on_test_edit: bool = False,
+        # After a successful write/edit to a test file (path matches
+        # test_*.py / *_test.py / */tests/*), the agent injects a synthetic
+        # `test_edit_hint` observation suggesting the model run_tests next.
+        # Default ON (promoted 2026-05-19 PM, Task A3 follow-up): the hint
+        # is informative, only fires on successful test-path writes, never
+        # commands, and the model is free to ignore. Addresses the
+        # documented failure mode of "model edits tests, declares done,
+        # never runs them." Cost: ~150 chars per test-edit observation,
+        # zero cost on non-test edits. To opt out:
+        #     Agent(..., suggest_run_tests_on_test_edit=False)
+        # See test_test_edit_hint.py for fire-condition guarantees.
+        suggest_run_tests_on_test_edit: bool = True,
         # Composes A1 + C4 (2026-05-19). When parse-with-errors returns
         # only errors (no valid tool calls), and `grammar` is set, and
         # this flag is True, the agent re-samples ONCE with the grammar

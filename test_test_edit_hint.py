@@ -69,17 +69,32 @@ class TestPathPatternRecognition(unittest.TestCase):
         self.assertFalse(Agent._looks_like_test_file("contest.py"))
 
 
-class TestHintDefaultOff(unittest.TestCase):
-    """The hint must not fire when the flag is at its default."""
+class TestHintDefaultOn(unittest.TestCase):
+    """The hint is default-ON as of the 2026-05-19 PM promotion. Explicit
+    opt-out must still suppress it."""
 
-    def test_default_is_off(self):
+    def test_default_is_on(self):
         agent = Agent(
             model=_stub_model(),
             registry=_stub_registry(),
         )
-        self.assertFalse(agent.suggest_run_tests_on_test_edit)
+        self.assertTrue(agent.suggest_run_tests_on_test_edit)
 
-    def test_no_hint_when_flag_off(self):
+    def test_default_fires_on_test_write(self):
+        # With the default (on), a test-path write produces a hint.
+        agent = Agent(
+            model=_stub_model(),
+            registry=_stub_registry(),
+        )
+        call = ToolCall(
+            name="write_file",
+            arguments={"path": "tests/test_foo.py"},
+            raw="",
+        )
+        result = ToolResult(name="write_file", success=True, content="ok")
+        self.assertIsNotNone(agent._maybe_suggest_run_tests(call, result))
+
+    def test_no_hint_when_explicitly_opted_out(self):
         agent = Agent(
             model=_stub_model(),
             registry=_stub_registry(),
