@@ -648,6 +648,10 @@ class ToolRegistry:
         # self._sanitizer_config.enabled = False.
         from engine.post_tool_sanitize import SanitizerConfig
         self._sanitizer_config = SanitizerConfig()
+        # Set True by build_default_registry(extended_tools=True). The Agent
+        # reads this to auto-prune the tool block per goal (Task A4 promotion,
+        # 2026-05-19 PM). Default False: lean registries don't need pruning.
+        self._extended_tools_enabled: bool = False
 
     def configure_gate(self, config, goal_text: str = "") -> None:
         """Engage the G-STEP confidence gate for this registry.

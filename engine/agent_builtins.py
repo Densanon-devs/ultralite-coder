@@ -837,6 +837,13 @@ def build_default_registry(
     """
     ws = Workspace(root=Path(workspace_root).resolve())
     reg = ToolRegistry()
+    # Record whether this registry was built with the extended tool set.
+    # The Agent reads this to decide whether to auto-prune the tool block
+    # per goal (Task A4 promotion, 2026-05-19 PM). Lean registries (10
+    # tools) never need pruning; extended registries (21 tools) regress
+    # the 14B from 97.6% to 85.7% per feedback_tool_count_regression.md,
+    # and per-goal pruning is the documented mitigation.
+    reg._extended_tools_enabled = bool(extended_tools)
 
     reg.register(ToolSchema(
         name="read_file",

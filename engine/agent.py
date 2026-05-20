@@ -206,6 +206,19 @@ class Agent:
         # the first-pass parse already failed (rare — <5% of turns).
         grammar=None,
         retry_with_grammar_on_parse_fail: bool = False,
+        # Per-goal tool pruning (Task A4 promotion, 2026-05-19 PM).
+        #   None  (default): auto-engage ONLY when the registry was built
+        #                    with extended_tools=True — prune the 21-tool
+        #                    set to the 8-tool floor + top-7 by goal
+        #                    relevance (k=15). Lean 10-tool registries are
+        #                    left untouched (pruning is a no-op there).
+        #   int:             prune to exactly this k regardless of registry
+        #                    mode. Pass 0 to force NO pruning even on
+        #                    extended registries.
+        # The pruned tool block is computed ONCE per run() (from the goal
+        # text) and reused across iterations, preserving the A2 cache
+        # stability invariant.
+        auto_prune_tools_k: Optional[int] = None,
         enable_goal_token_sweep: bool = True,
         require_mutating_action: bool = False,
         # Live self_heal diagnose-and-repair injection on consecutive
@@ -280,6 +293,10 @@ class Agent:
         self.suggest_run_tests_on_test_edit = suggest_run_tests_on_test_edit
         self.grammar = grammar
         self.retry_with_grammar_on_parse_fail = retry_with_grammar_on_parse_fail
+        self.auto_prune_tools_k = auto_prune_tools_k
+        # Default k applied when auto_prune_tools_k is None AND the registry
+        # is in extended mode. 15 = 8-tool floor + top-7 by relevance.
+        self._DEFAULT_EXTENDED_PRUNE_K = 15
         self.enable_goal_token_sweep = bool(enable_goal_token_sweep)
         self.require_mutating_action = bool(require_mutating_action)
         self.enable_self_heal = bool(enable_self_heal)
@@ -312,6 +329,10 @@ class Agent:
         # output (or None on success). See engine/self_heal.py.
         self._failure_streak: list = []
         self._self_heal_fired: int = 0
+        # Pruned tool block, computed once per run() from the goal when
+        # tool pruning is active (Task A4 promotion). None = use the full
+        # registry block. Reused across iterations to stay cache-stable.
+        self._tool_block_override: Optional[str] = None
 
     # ── prompt assembly ──
 
@@ -333,10 +354,47 @@ class Agent:
             parts.append(self._goal_augmentor_block.strip())
         if self._memory_block:
             parts.append(self._memory_block)
-        tool_block = self.registry.hermes_system_block()
+        # Use the per-goal pruned block when one was computed at run()
+        # start (Task A4); otherwise the full registry block. The override
+        # is a string set once per run, so this stays cache-stable.
+        if self._tool_block_override is not None:
+            tool_block = self._tool_block_override
+        else:
+            tool_block = self.registry.hermes_system_block()
         if tool_block:
             parts.append(tool_block)
         return "\n\n".join(parts)
+
+    def _resolve_prune_k(self) -> Optional[int]:
+        """Effective tool-prune k for this run, or None for no pruning.
+
+        - Explicit auto_prune_tools_k wins (0 means "no pruning").
+        - Else auto-engage at the extended-mode default ONLY when the
+          registry was built with extended_tools=True.
+        """
+        if self.auto_prune_tools_k is not None:
+            return self.auto_prune_tools_k if self.auto_prune_tools_k > 0 else None
+        if getattr(self.registry, "_extended_tools_enabled", False):
+            return self._DEFAULT_EXTENDED_PRUNE_K
+        return None
+
+    def _compute_tool_block_override(self, goal: str) -> Optional[str]:
+        """Build the pruned Hermes tool block for *goal*, or None to use the
+        full block. Never raises — pruning is an optimization, not a
+        correctness feature, so any failure falls back to the full set."""
+        k = self._resolve_prune_k()
+        if k is None:
+            return None
+        try:
+            pruned = self.registry.enabled_tools_for_goal(goal, k=k)
+            # No-op guard: if pruning didn't actually drop anything, leave
+            # the override unset so the byte-identical full block is used.
+            if len(pruned) >= len(self.registry.enabled_tools()):
+                return None
+            return self.registry.hermes_system_block(pruned)
+        except Exception as exc:
+            logger.warning("tool pruning failed (%s); using full tool set", exc)
+            return None
 
     def prefix_hash(self) -> str:
         """Stable hash of the cacheable prompt prefix (system block only).
@@ -2068,6 +2126,17 @@ class Agent:
                         self._goal_augmentor_block = block.strip()
                 except Exception as exc:
                     logger.warning(f"augment_for_goal callback raised: {exc!r}")
+
+            # Per-goal tool pruning (Task A4 promotion). Computed once here
+            # from the goal text, then reused across iterations via
+            # _system_prompt(). None = full tool block. Auto-engages for
+            # extended-mode registries; no-op for lean registries.
+            self._tool_block_override = self._compute_tool_block_override(goal)
+            if self._tool_block_override is not None:
+                self._emit(AgentEvent(
+                    "tools_pruned", 0,
+                    payload={"k": self._resolve_prune_k()},
+                ))
 
         if not continue_session and self.memory is not None:
             notes = self.memory.load()
