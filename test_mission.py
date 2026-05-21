@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 from engine.mission import Mission, MissionStep, MISSION_FILENAME
-from engine.agent_builtins import build_default_registry, mission_state_hint
+from engine.agent_builtins import (
+    build_default_registry,
+    mission_state_hint,
+    mission_pre_finish_check,
+)
 
 
 # ── Mission dataclass: persistence + mutation ────────────────────────────────
@@ -255,3 +259,67 @@ class TestMissionTool:
         fn(action="start", goal="g", steps=["a"])
         with pytest.raises(ValueError, match="unknown action"):
             fn(action="frobnicate")
+
+
+class TestMissionPreFinishCheck:
+    def test_returns_none_when_no_mission(self, tmp_path):
+        assert mission_pre_finish_check(tmp_path) is None
+
+    def test_check_accepts_when_complete(self, tmp_path):
+        m = Mission(goal="g")
+        m.set_steps(["a", "b"])
+        m.mark_step_done(1)
+        m.mark_step_done(2)
+        m.save(tmp_path)
+        check = mission_pre_finish_check(tmp_path)
+        assert check is not None
+        assert check() is None  # complete → accept the final answer
+
+    def test_check_nudges_when_pending(self, tmp_path):
+        m = Mission(goal="Ship the feature")
+        m.set_steps(["write code", "write tests", "run tests"])
+        m.mark_step_done(1, note="done")
+        m.save(tmp_path)
+        check = mission_pre_finish_check(tmp_path)
+        nudge = check()
+        assert nudge is not None
+        assert "Ship the feature" in nudge
+        # Both pending steps named, by number
+        assert "write tests" in nudge and "run tests" in nudge
+        assert "step 2" in nudge and "step 3" in nudge
+        # The done step is NOT listed as pending
+        assert "step 1:" not in nudge
+        # Concrete step_done call examples for each pending step
+        assert 'mission(action="step_done", n=2' in nudge
+        assert 'mission(action="step_done", n=3' in nudge
+        # Tells the model NOT to redo the work
+        assert "do NOT redo" in nudge or "not redo" in nudge.lower()
+
+    def test_check_accepts_when_no_steps(self, tmp_path):
+        # A mission with a goal but no steps yet — nothing to nudge about.
+        Mission(goal="g").save(tmp_path)
+        check = mission_pre_finish_check(tmp_path)
+        assert check is not None
+        assert check() is None
+
+    def test_check_tolerates_deleted_mission_mid_run(self, tmp_path):
+        # The check callable is captured at build time; if the file vanishes
+        # later, the callable must not crash — just accept.
+        Mission(goal="g").save(tmp_path)
+        check = mission_pre_finish_check(tmp_path)
+        Mission.delete(tmp_path)
+        assert check() is None
+
+    def test_check_re_reads_file_each_call(self, tmp_path):
+        # The callable reflects the CURRENT mission state, not a snapshot.
+        m = Mission(goal="g")
+        m.set_steps(["a", "b"])
+        m.save(tmp_path)
+        check = mission_pre_finish_check(tmp_path)
+        assert check() is not None  # 2 pending → nudge
+        # Complete it on disk
+        m2 = Mission.load(tmp_path)
+        m2.mark_step_done(1)
+        m2.mark_step_done(2)
+        m2.save(tmp_path)
+        assert check() is None  # now complete → accept

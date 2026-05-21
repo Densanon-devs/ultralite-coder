@@ -177,7 +177,7 @@ Phase 14 ReAct loop. The agent is **loader-agnostic** — it accepts any object 
 
 **Tool format:** Qwen 2.5 native Hermes format: `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`. Parser uses `json.JSONDecoder(strict=False)` so literal newlines/tabs inside string values (common for multi-line `write_file` content) parse cleanly. Tool schemas are emitted in the system prompt inside a `<tools>...</tools>` block, exactly the format the model was trained on.
 
-**Builtin tools** (`engine/agent_builtins.py`, 9 total):
+**Builtin tools** (`engine/agent_builtins.py`, 9 core + 1 opt-in):
 
 | Tool | Resolves paths via | Notes |
 |---|---|---|
@@ -190,10 +190,18 @@ Phase 14 ReAct loop. The agent is **loader-agnostic** — it accepts any object 
 | `run_bash` | cwd or Workspace | **risky** — agent loop prompts y/N before executing |
 | `run_tests` | Workspace | pytest / unittest / npm / go / cargo |
 | `remember` | (memory store) | optional — only registered when `AgentMemory` is provided |
+| `mission` | Workspace | optional — only registered when `enable_mission=True` (see Mission tracking below) |
 
 **Auto-verification:** After every successful `write_file`/`edit_file` on a `.py` file, the agent runs `compile()` on the result and threads a synthetic `auto_verify` `ToolResult` into the same observation block. If it's a `SyntaxError`, the model sees it on the very next turn and can fix it before continuing. Skipped cleanly if the file isn't resolvable (no false negatives).
 
 **Cross-session memory** (`engine/agent_memory.py`): per-project notes at `~/.ultralight-coder/memory/<sha256(workspace)[:12]>/notes.md`. Loaded into the system prompt at run start under a `# Notes from previous sessions` block. The `remember` tool lets the model append a note mid-loop. Append-only Markdown bullets, capped at 30 entries by default, 500 chars per note.
+
+**Mission tracking (durable multi-step state, opt-in)** (`engine/mission.py` + the `mission` builtin): for long multi-step work that may span context-compaction or multiple sessions. A single `<workspace>/.ulcagent_mission.json` file is the source of truth (goal + numbered steps + notes + next-action). Distinct from `remember` (free-form cross-session notes) and `plan` (in-run-only ephemeral todo): mission is **structured, persistent, and resume-shaped**.
+
+- **Enable:** `enable_mission=True` on the registry. ulcagent auto-engages it when you pass `--mission` OR when a `.ulcagent_mission.json` already exists in the workspace (so a resumed mission is picked up automatically).
+- **Tool actions:** `start` (goal + steps), `status`, `step_done` (n, optional note), `add_step` (title), `note` (text), `next` (text). All persist to disk immediately.
+- **Resume:** on run start the mission summary is injected into the system prompt via `mission_state_hint()`, so the agent sees where it left off.
+- **Anti-abandon nudge:** `mission_pre_finish_check()` (wired through `Agent(pre_finish_check=...)`, capped at `pre_finish_max_retries=2`) intercepts a final answer while steps are still pending and nudges the model to mark them done (or keep working) before exiting — closes the "narrated completion without calling `step_done`" failure mode.
 
 **Risky-tool confirmation:** `run_bash` is flagged `risky=True`. The agent's `confirm_risky` callback (in `main.py._confirm_risky_tool`) shows the proposed args and prompts `Approve? [y/N]`. Default deny on Ctrl+C/EOF. Denied calls return a `ToolResult(success=False, error="User denied...")` that the model sees and can recover from.
 
@@ -260,6 +268,7 @@ ulcagent "fix the bug"      # one-shot
 ulcagent --warm             # keep model loaded between goals (~10GB VRAM, instant response)
 ulcagent --extended         # enable 21 advanced tools (rename, git, checkpoint, etc.)
 ulcagent --web              # enable web_search + fetch_url (per-call y/N confirm)
+ulcagent --mission          # enable durable mission tracking (auto-on if .ulcagent_mission.json exists)
 ```
 
 **Profiles (auto-detected from goal keywords):**

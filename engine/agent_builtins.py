@@ -825,6 +825,68 @@ def mission_state_hint(workspace_root: Path | str) -> str:
         return ""
 
 
+def mission_pre_finish_check(workspace_root: Path | str):
+    """Return a `pre_finish_check` callable (or None if there's no mission).
+
+    Wire this into Agent(pre_finish_check=...). When the model declares done
+    (no tool calls), the Agent invokes it: if the active mission still has
+    pending steps, it returns a nudge string that the Agent injects as a
+    retry message — "you didn't update the mission; mark the steps you
+    completed via mission(step_done,...) or finish the rest". Returns None
+    (accept) when the mission is complete or absent.
+
+    This closes the "narration without action" gap: the model does the work
+    but reports completion in prose instead of calling mission(step_done).
+    Capped retries (Agent.pre_finish_max_retries, default 2) prevent loops —
+    after that the answer is accepted even if the mission is still open
+    (handles legitimately-blocked steps).
+    """
+    try:
+        from engine.mission import Mission
+        if not Mission.exists(workspace_root):
+            return None
+    except Exception:
+        return None
+
+    def _check():
+        try:
+            from engine.mission import Mission
+            m = Mission.load(workspace_root)
+        except Exception:
+            return None
+        if m is None or m.is_complete or not m.steps:
+            return None
+        pending = [s for s in m.steps if not s.done]
+        if not pending:
+            return None
+        pending_lines = "\n".join(f"  step {s.n}: {s.title}" for s in pending)
+        # Explicit step_done call examples — the 14B otherwise re-does the
+        # work instead of making the bookkeeping call. Make it dead obvious
+        # that the ONLY action needed (for already-done steps) is the call.
+        example_calls = "\n".join(
+            f'  mission(action="step_done", n={s.n}, note="<one line: how step {s.n} got done>")'
+            for s in pending
+        )
+        return (
+            f"STOP — bookkeeping needed before you finish. You've been doing "
+            f"the WORK on mission \"{m.goal}\", but the mission file "
+            f"(.ulcagent_mission.json) is the source of truth for progress "
+            f"and it's STALE. It still lists these step(s) as not-done:\n"
+            f"{pending_lines}\n\n"
+            "Look at what you've actually produced this session. For EACH step "
+            "above that is in fact done, your next action is JUST the "
+            "bookkeeping call — do NOT redo the work:\n"
+            f"{example_calls}\n\n"
+            "If a step genuinely still needs doing, do it. If a step is "
+            "blocked this session, call mission(action=\"note\", text=\"step N "
+            "blocked: ...\") and then stopping is fine. But do not give a "
+            "final answer while the mission file shows steps not-done — update "
+            "it first."
+        )
+
+    return _check
+
+
 def build_default_registry(
     workspace_root: Path | str,
     memory: Optional[AgentMemory] = None,

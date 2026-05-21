@@ -395,6 +395,15 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         examples_dir=repo_root / "data" / "augmentor_examples"
     )
 
+    # When a mission is active, nudge the model to keep the mission file
+    # updated before it declares done (closes the "did the work but narrated
+    # completion instead of calling mission(step_done)" gap). No-op when
+    # there's no mission. Capped retries via Agent.pre_finish_max_retries.
+    pre_finish_check = None
+    if enable_mission:
+        from engine.agent_builtins import mission_pre_finish_check
+        pre_finish_check = mission_pre_finish_check(workspace)
+
     agent = Agent(
         model=mgr.bm,
         registry=registry,
@@ -407,6 +416,7 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         max_tokens_per_turn=int(cfg_max) if cfg_max else 1024,
         temperature=cfg_temp if cfg_temp is not None else 0.1,
         confirm_risky=_confirm_risky,
+        pre_finish_check=pre_finish_check,
         augment_for_goal=augment_for_goal,
         # Re-enabled 2026-05-10 after the security-domain soak found 4/5
         # failures hitting the JSON quote-escape parse error 5+ times in
@@ -1567,6 +1577,8 @@ _HELP_TEXT = """
     --warm          Keep model loaded between goals (instant, ~10GB VRAM)
     --extended      Enable 21 advanced tools (git, checkpoint, etc.)
     --web           Enable web_search + fetch_url tools (per-call y/N confirm)
+    --mission       Durable multi-step mission tracking (auto-on if
+                    .ulcagent_mission.json exists; survives sessions/compaction)
     --yes           Auto-approve all risky tool calls (unattended runs only)
     --new-engagement NAME
                     Scaffold a new engagement workspace (scope/, evidence/,
