@@ -75,6 +75,12 @@ class AgentResult:
     transcript: list[dict[str, str]] = field(default_factory=list)
     compactions: int = 0  # how many context-compaction passes fired during this run
     self_heals: int = 0   # how many live diagnose-and-repair injections fired
+    # Coarse total generation cost: sum of prompt+completion chars across every
+    # model.generate() call this run, converted to tokens at the harness's
+    # ~3.25 chars/token ratio. Approximate (char-based, tokenizer-free so it
+    # works with stub models) but consistent run-to-run — meant for RELATIVE
+    # comparison, e.g. ranking which failure modes waste the most tokens.
+    est_tokens: int = 0
 
 
 # ── System prompt ───────────────────────────────────────────────
@@ -295,6 +301,9 @@ class Agent:
         # output (or None on success). See engine/self_heal.py.
         self._failure_streak: list = []
         self._self_heal_fired: int = 0
+        # Running sum of prompt+completion chars across all generate() calls
+        # this run; converted to est_tokens on the result. See AgentResult.
+        self._gen_chars: int = 0
         # How many times the json_recovery regeneration pass fired this run,
         # and how many of those actually recovered ≥1 parseable call. Surfaced
         # for the A/B so a 0-firing result is distinguishable from a 0-help one.
@@ -345,6 +354,7 @@ class Agent:
             logger.exception("json_recovery regeneration failed")
             return None
         recovered_text = (recovered_text or "").strip()
+        self._gen_chars += len(recovery_prompt) + len(recovered_text)
         calls, errors = self.registry.parse_with_errors(recovered_text)
         if calls:
             self._json_recovery_recovered += 1
@@ -2098,6 +2108,7 @@ class Agent:
                 break
 
             response = (response or "").strip()
+            self._gen_chars += len(prompt) + len(response)
             self._emit(AgentEvent("model_text", iteration, response))
 
             calls, parse_errors = self.registry.parse_with_errors(response)
@@ -2630,6 +2641,7 @@ class Agent:
             transcript=list(self._transcript),
             compactions=self._compactions,
             self_heals=self._self_heal_fired,
+            est_tokens=round(self._gen_chars / 3.25),
         )
 
 

@@ -95,6 +95,7 @@ class TaskResult:
     stop_reason: str
     failure_types: list[str] = field(default_factory=list)
     compactions: int = 0  # how many context-compaction passes fired during this task
+    est_tokens: int = 0   # coarse total generation cost (prompt+completion), for fail-cost ranking
 
 
 # ── Task library ────────────────────────────────────────────────
@@ -1388,6 +1389,7 @@ def run_one_task(
                 stop_reason=result.stop_reason,
                 failure_types=tags,
                 compactions=getattr(result, "compactions", 0),
+                est_tokens=getattr(result, "est_tokens", 0),
             )
 
 
@@ -1636,6 +1638,16 @@ def main() -> int:
                 counts[tag] = counts.get(tag, 0) + 1
         for tag, n in sorted(counts.items(), key=lambda kv: -kv[1]):
             print(f"  {tag:<20} {n}")
+
+        # Fail-cost ranking (Open Agent Leaderboard: failed runs cost 20-54%
+        # more tokens than successful ones). Surface the most wasteful failures
+        # first so fixes are prioritized by token-leverage, not just frequency.
+        failed = [r for r in results if not r.passed and r.est_tokens]
+        if failed:
+            print("\nFailures by token cost (most wasteful first):")
+            for r in sorted(failed, key=lambda r: -r.est_tokens):
+                tags = ",".join(r.failure_types) or "?"
+                print(f"  {r.est_tokens:>8} tok  {r.name:<24} [{tags}] ({r.stop_reason})")
 
     # JSON output
     output_path = args.output or f"bench_agentic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
