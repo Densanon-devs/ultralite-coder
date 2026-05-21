@@ -1122,6 +1122,7 @@ def run_one_task(
     shared_model: Any = None,
     auto_flag: bool = False,
     enable_self_heal: bool = True,
+    json_recovery: bool = False,
 ) -> TaskResult:
     """Run one task against the agent. Uses a fresh tmp workspace each time.
 
@@ -1316,6 +1317,7 @@ def run_one_task(
                     confirm_risky=(lambda _c: True) if auto_approve_risky else None,
                     on_event=on_event,
                     enable_self_heal=enable_self_heal,
+                    json_recovery=json_recovery,
                 )
                 if context_char_budget is not None:
                     agent_kwargs["context_char_budget"] = context_char_budget
@@ -1344,6 +1346,13 @@ def run_one_task(
                 )
             if owns_model:
                 bm.unload()
+
+            # Surface json_recovery activity so a 0-firing A/B result is
+            # distinguishable from a 0-help one (mirrors the self_heal finding).
+            jr_fired = getattr(agent, "_json_recovery_fired", 0)
+            if jr_fired:
+                jr_ok = getattr(agent, "_json_recovery_recovered", 0)
+                print(f"   json_recovery: fired {jr_fired}x, recovered {jr_ok}x")
 
             passed, reason = task.check(ws, result)
             tags = [] if passed else classify_failure(task, result, reason)
@@ -1487,6 +1496,15 @@ def main() -> int:
              "2026-05-05). Useful when running stress benches or smaller models "
              "with weaker tool-call discipline that may form same-class failure streaks.",
     )
+    parser.add_argument(
+        "--json-recovery", action="store_true",
+        help="Engage the json_recovery layer (default OFF): on an unparseable "
+             "tool call (parser returns errors, zero calls) do ONE ChatML "
+             "regeneration pass asking the model for valid JSON before falling "
+             "through to the normal parse-error feedback. Targets the "
+             "JSON-quote-recovery ceiling. Use for an A/B vs the baseline; "
+             "per-task firing counts are printed so 0-firing is visible.",
+    )
     args = parser.parse_args()
 
     # --auto-promote implies --auto-flag (otherwise nothing lands in the
@@ -1548,6 +1566,7 @@ def main() -> int:
                     # default OFF; --self-heal-on engages, --no-self-heal
                     # is redundant but kept for explicit-suppression callers.
                     enable_self_heal=(args.self_heal_on and not args.no_self_heal),
+                    json_recovery=args.json_recovery,
                 )
             except KeyboardInterrupt:
                 print("\n[aborted by user]")

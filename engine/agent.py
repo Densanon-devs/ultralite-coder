@@ -192,6 +192,18 @@ class Agent:
         # with weaker tool-call discipline. See
         # session_2026-05-05_self_heal_ab_finding.md.
         enable_self_heal: bool = False,
+        # JSON parse-failure recovery. When the model emits tool-call-shaped
+        # text whose JSON ALL fails to parse (parser returns errors but zero
+        # calls), do ONE regeneration pass: feed the broken turn back as a
+        # ChatML user-correction turn asking for valid JSON, re-parse, and if
+        # that yields calls proceed as if the model got it right the first
+        # time. Distinct from the multi-tier in-parser repair in agent_tools
+        # (_decode_with_repair) which fixes *recoverable* JSON without a model
+        # call — this catches the residual case where the body is too broken
+        # to mechanically repair. Default-OFF so it's A/B-measurable against
+        # the historical baseline (mirrors enable_self_heal). Tested for the
+        # JSON-quote-recovery ceiling per feedback_14b_tool_call_ceilings.md.
+        json_recovery: bool = False,
         suppress_think: bool = False,
         max_iterations: int = 10,
         max_wall_time: float = 300.0,
@@ -253,6 +265,7 @@ class Agent:
         self.enable_goal_token_sweep = bool(enable_goal_token_sweep)
         self.require_mutating_action = bool(require_mutating_action)
         self.enable_self_heal = bool(enable_self_heal)
+        self.json_recovery = bool(json_recovery)
         self.suppress_think = bool(suppress_think)
         self.max_iterations = max(1, int(max_iterations))
         self.max_wall_time = float(max_wall_time)
@@ -282,6 +295,62 @@ class Agent:
         # output (or None on success). See engine/self_heal.py.
         self._failure_streak: list = []
         self._self_heal_fired: int = 0
+        # How many times the json_recovery regeneration pass fired this run,
+        # and how many of those actually recovered ≥1 parseable call. Surfaced
+        # for the A/B so a 0-firing result is distinguishable from a 0-help one.
+        self._json_recovery_fired: int = 0
+        self._json_recovery_recovered: int = 0
+
+    # ── json recovery ──
+
+    _JSON_REPAIR_INSTRUCTION = (
+        "Your previous message was meant to contain a tool call but its JSON "
+        "could not be parsed, so nothing ran. Re-emit ONLY the corrected tool "
+        "call(s), each wrapped in <tool_call>...</tool_call> tags with VALID "
+        "JSON. Rules: use regular double quotes for all keys and string values "
+        "(never Python f\"...\" or '...'); escape inner double quotes as \\\"; "
+        "use only the valid JSON escapes \\\" \\\\ \\/ \\b \\f \\n \\r \\t "
+        "\\uXXXX. Do not add any prose — output the <tool_call> block(s) only."
+    )
+
+    def _attempt_json_recovery(
+        self,
+        prompt: str,
+        broken_response: str,
+        parse_errors: list,
+        gen_kwargs: dict,
+    ):
+        """One-shot regeneration to recover an unparseable tool call.
+
+        Appends the broken assistant turn + a user correction turn to the
+        ChatML *prompt* and regenerates once. Returns ``(response, calls,
+        errors)`` if the regeneration produced ≥1 parseable call, else None
+        (caller falls through to the normal parse-error surfacing).
+
+        Bounded to a single model call — never loops. Any exception is
+        swallowed so a recovery failure can never crash the agent loop; we
+        just return None and let the existing error path run.
+        """
+        self._json_recovery_fired += 1
+        err_block = "\n".join(str(e) for e in parse_errors[:3])
+        recovery_prompt = (
+            f"{prompt}{broken_response}<|im_end|>\n"
+            f"<|im_start|>user\n{self._JSON_REPAIR_INSTRUCTION}\n\n"
+            f"Parser errors:\n{err_block}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        try:
+            recovered_text = self.model.generate(recovery_prompt, **gen_kwargs)
+        except Exception:
+            logger.exception("json_recovery regeneration failed")
+            return None
+        recovered_text = (recovered_text or "").strip()
+        calls, errors = self.registry.parse_with_errors(recovered_text)
+        if calls:
+            self._json_recovery_recovered += 1
+            self._emit(AgentEvent("model_text", -1, recovered_text))
+            return recovered_text, calls, errors
+        return None
 
     # ── prompt assembly ──
 
@@ -2032,6 +2101,21 @@ class Agent:
             self._emit(AgentEvent("model_text", iteration, response))
 
             calls, parse_errors = self.registry.parse_with_errors(response)
+
+            # JSON parse-failure recovery (opt-in via json_recovery=True).
+            # Fires only when the model clearly ATTEMPTED a tool call but the
+            # JSON was too broken for the in-parser repair tiers to salvage
+            # (zero calls, ≥1 parse error). One ChatML regeneration pass feeds
+            # the broken turn back asking for valid JSON; if it yields calls we
+            # transparently adopt the recovered turn and the loop proceeds as
+            # normal. Bounded to a single attempt per iteration so it can never
+            # add an unbounded inner loop. No-op when calls already parsed.
+            if self.json_recovery and not calls and parse_errors:
+                recovered = self._attempt_json_recovery(
+                    prompt, response, parse_errors, gen_kwargs
+                )
+                if recovered is not None:
+                    response, calls, parse_errors = recovered
 
             # Mid-thought truncation detector for R1-distill-style reasoning
             # models: if the response contains `<think>` with no matching
