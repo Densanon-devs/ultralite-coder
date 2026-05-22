@@ -96,6 +96,10 @@ class TaskResult:
     failure_types: list[str] = field(default_factory=list)
     compactions: int = 0  # how many context-compaction passes fired during this task
     est_tokens: int = 0   # coarse total generation cost (prompt+completion), for fail-cost ranking
+    # Which of the three ceilings blocked this task (COSMO-Agent decomposition).
+    # See classify_failure_axes(). Additive/empty by default; one or more of
+    # {"schema-format", "toolchain", "feasibility"} on a failed task.
+    failure_axes: list[str] = field(default_factory=list)
 
 
 # ── Task library ────────────────────────────────────────────────
@@ -1114,6 +1118,79 @@ def classify_failure(task: AgenticTask, result: Any, reason: str) -> list[str]:
     return tags
 
 
+# Harness-injected synthetic ToolResults — these are NOT real tool dispatches,
+# so a failed one must never be counted as a "toolchain" failure. `parse_error`
+# is handled separately (it's the schema-format signal). Everything else here
+# is a nudge/gate the agent loop threads back to steer the model.
+_SYNTHETIC_TOOL_NAMES = frozenset({
+    "parse_error",
+    "auto_verify",
+    "auto_apply",
+    "task_incomplete",
+    "stuck_repeat",
+    "mutation_gate",
+    "truncated_reasoning",
+    "self_heal_diagnose",
+})
+
+
+def classify_failure_axes(result: Any, reason: str) -> list[str]:
+    """Decompose a task failure into the three COSMO-Agent ceilings.
+
+    PURE INSTRUMENTATION over signals already present on the AgentResult — does
+    not change agent behavior. A failed task gets one or more of:
+
+    - "schema-format": the model emitted a tool call but the JSON/format was
+      malformed and could not be parsed/dispatched (synthetic `parse_error`
+      ToolResults, i.e. the parser produced errors with zero calls that turn).
+    - "toolchain": a tool call parsed and dispatched but the tool itself errored
+      (a failed ToolResult whose name is a REAL tool, not a harness nudge).
+    - "feasibility": the agent ran to completion (answered) but the produced
+      code doesn't actually work — task verification failed despite a clean run.
+
+    Returns [] when `result` is None (e.g. setup/runner crash before any run).
+    Axes are additive; a task can hit more than one (a run can have malformed
+    calls AND end with broken code).
+    """
+    if result is None:
+        return []
+    axes: list[str] = []
+
+    tool_results = getattr(result, "tool_results", None) or []
+
+    # schema-format: any synthetic parse_error observation means the model
+    # emitted a call the parser/validator could not turn into a dispatchable
+    # ToolCall (multi-line JSON, broken quotes, etc).
+    if any(getattr(r, "name", "") == "parse_error" for r in tool_results):
+        axes.append("schema-format")
+
+    # toolchain: a real tool dispatched but returned failure. Exclude the
+    # harness-injected synthetic results (parse_error/auto_verify/gates/nudges).
+    if any(
+        not getattr(r, "success", True)
+        and getattr(r, "name", "") not in _SYNTHETIC_TOOL_NAMES
+        for r in tool_results
+    ):
+        axes.append("toolchain")
+
+    # feasibility: the run completed normally (model gave a final answer) yet
+    # the task's verification still failed — the code itself doesn't work. We
+    # only assert this on a clean stop; timeouts/loop-limits/model-errors are
+    # process failures, not code-feasibility failures, and are captured by the
+    # other axes / stop_reason.
+    if getattr(result, "stop_reason", "") == "answered":
+        axes.append("feasibility")
+
+    # Fallback: a failed task that produced no parse errors, no failed real
+    # tool, and did not stop on "answered" (e.g. max_iterations / wall_time /
+    # model_error). Attribute to schema-format only if the model never managed
+    # a clean dispatch at all; otherwise leave as "process" so it's visible
+    # without being miscredited to a code ceiling.
+    if not axes:
+        axes.append("process")
+    return axes
+
+
 def run_one_task(
     task: AgenticTask,
     config_path: str,
@@ -1147,6 +1224,7 @@ def run_one_task(
                 name=task.name, difficulty=task.difficulty, passed=False,
                 reason=f"setup failed: {exc}", iterations=0, tool_calls=0,
                 wall_time=0.0, stop_reason="setup_error", failure_types=["setup_error"],
+                failure_axes=["process"],
             )
 
         # Build agent via run_agent_fast's shell approach but use an Agent
@@ -1344,6 +1422,7 @@ def run_one_task(
                     wall_time=time.monotonic() - start,
                     stop_reason="exception",
                     failure_types=["exception"],
+                    failure_axes=["process"],
                 )
             if owns_model:
                 bm.unload()
@@ -1357,6 +1436,7 @@ def run_one_task(
 
             passed, reason = task.check(ws, result)
             tags = [] if passed else classify_failure(task, result, reason)
+            axes = [] if passed else classify_failure_axes(result, reason)
 
             # Auto-flag-on-fail: silently write YAML augmentor entries for
             # any known failure pattern detected in this run. Only fires when
@@ -1390,6 +1470,7 @@ def run_one_task(
                 failure_types=tags,
                 compactions=getattr(result, "compactions", 0),
                 est_tokens=getattr(result, "est_tokens", 0),
+                failure_axes=axes,
             )
 
 
@@ -1582,6 +1663,7 @@ def main() -> int:
                     iterations=0, tool_calls=0, wall_time=0.0,
                     stop_reason="runner_crash",
                     failure_types=["runner_crash"],
+                    failure_axes=["process"],
                 )
             results.append(r)
         if aborted:
@@ -1649,6 +1731,27 @@ def main() -> int:
                 tags = ",".join(r.failure_types) or "?"
                 print(f"  {r.est_tokens:>8} tok  {r.name:<24} [{tags}] ({r.stop_reason})")
 
+        # Failures by axis (COSMO-Agent decomposition): tell us WHICH ceiling
+        # blocked each task — a malformed-JSON ceiling (schema-format), a tool
+        # that errored (toolchain), or code that ran but doesn't work
+        # (feasibility). A task can land on more than one axis, so axis counts
+        # may sum to more than the failed-task count. Pure instrumentation —
+        # prioritizes engineering effort by ceiling, not just task name.
+        axis_failed = [r for r in results if not r.passed]
+        if axis_failed:
+            axis_counts: dict[str, int] = {}
+            for r in axis_failed:
+                for ax in (r.failure_axes or ["process"]):
+                    axis_counts[ax] = axis_counts.get(ax, 0) + 1
+            print("\nFailures by axis (which ceiling blocked the task):")
+            for ax in ("schema-format", "toolchain", "feasibility", "process"):
+                if ax in axis_counts:
+                    print(f"  {ax:<16} {axis_counts[ax]}")
+            # Any axes outside the canonical set (future-proofing) sort last.
+            for ax, n in sorted(axis_counts.items(), key=lambda kv: -kv[1]):
+                if ax not in ("schema-format", "toolchain", "feasibility", "process"):
+                    print(f"  {ax:<16} {n}")
+
     # JSON output
     output_path = args.output or f"bench_agentic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     import statistics as _stats
@@ -1686,6 +1789,7 @@ def main() -> int:
                 "wall_time": r.wall_time,
                 "stop_reason": r.stop_reason,
                 "failure_types": r.failure_types,
+                "failure_axes": r.failure_axes,
                 "compactions": r.compactions,
             }
             for r in results
