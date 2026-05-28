@@ -241,6 +241,16 @@ class Agent:
         # engine/destructive_command_gate.py + the May 2026 r/ClaudeAI
         # `rm -rf ~/` incident for rationale.
         confirm_destructive: Optional[Callable[["ToolCall", list], bool]] = None,
+        # Post-execution destructive-command audit. The complement to the
+        # destructive gate above: once an APPROVED destructive run_bash has
+        # actually executed, snapshot the workspace before/after, record the
+        # real filesystem delta (deleted/created/modified) to an append-only
+        # <workspace>/.ulcagent_audit.log, and thread a synthetic
+        # `command_audit` observation back to the model so it can react to an
+        # unintended blast radius. Additive (only fires on gated destructive
+        # commands, which no benchmark task issues) — see engine/command_audit.py.
+        # No-op when workspace_root is None (nowhere to snapshot/log).
+        audit_destructive: bool = True,
         # Pre-finish check: called when the model declares "done" (no tool
         # calls). Returns None to accept the answer, or a non-empty string
         # describing what's still wrong — which gets injected as a user
@@ -280,6 +290,14 @@ class Agent:
         self.repeat_penalty = repeat_penalty
         self.confirm_risky = confirm_risky
         self.confirm_destructive = confirm_destructive
+        self.audit_destructive = bool(audit_destructive)
+        # Holds the pre-execution workspace snapshot for an in-flight
+        # approved destructive command, keyed by id(call). Populated in
+        # _execute_call right before registry.execute, consumed by
+        # _maybe_audit_destructive after. Destructive run_bash is never
+        # parallelized (run_bash isn't in _PARALLELIZABLE_TOOLS), so at most
+        # one is in flight at a time, but keying by id(call) is robust anyway.
+        self._pending_audit: dict[int, tuple[list, object]] = {}
         self.pre_finish_check = pre_finish_check
         self.pre_finish_max_retries = max(0, int(pre_finish_max_retries))
         self.augment_for_goal = augment_for_goal
@@ -2014,7 +2032,61 @@ class Agent:
                             f"User denied destructive command (matched: {matched_ids})"
                         ),
                     )
+                # Approved destructive command: snapshot the workspace BEFORE
+                # execution so _maybe_audit_destructive can compute the real
+                # filesystem delta afterward. Stored by id(call) and consumed
+                # in the result loop.
+                if self.audit_destructive and self.workspace_root is not None:
+                    from engine.command_audit import snapshot_workspace
+                    self._pending_audit[id(call)] = (
+                        [m.pattern_id for m in destructive_matches],
+                        snapshot_workspace(self.workspace_root),
+                    )
         return self.registry.execute(call)
+
+    def _maybe_audit_destructive(
+        self, call: ToolCall, result: ToolResult
+    ) -> Optional[ToolResult]:
+        """Post-execution audit for an approved destructive command.
+
+        Consumes the pre-execution snapshot captured in `_execute_call`,
+        re-snapshots the workspace, computes the real filesystem delta, appends
+        it to ``<workspace>/.ulcagent_audit.log``, and returns a synthetic
+        ``command_audit`` observation when files actually changed (or the
+        snapshot was skipped). Returns ``None`` when there's no pending snapshot
+        for this call (the normal, non-destructive path) or nothing worth
+        surfacing — so non-destructive commands thread nothing.
+        """
+        pending = self._pending_audit.pop(id(call), None)
+        if pending is None:
+            return None
+        matched_ids, before = pending
+        from engine.command_audit import (
+            AUDIT_LOG_NAME,
+            append_audit_log,
+            diff_snapshots,
+            format_audit_observation,
+            snapshot_workspace,
+        )
+
+        command_arg = ""
+        if isinstance(call.arguments, dict):
+            command_arg = call.arguments.get("command", "") or ""
+        after = snapshot_workspace(self.workspace_root)
+        audit = diff_snapshots(before, after, command_arg, matched_ids)
+        if self.workspace_root is not None:
+            append_audit_log(self.workspace_root / AUDIT_LOG_NAME, audit)
+        # Thread an observation only when there's something worth surfacing —
+        # an actual delta, or a skipped snapshot (so the model knows the audit
+        # couldn't capture). A clean no-change destructive command threads
+        # nothing, to avoid noise.
+        if audit.changed_any() or audit.skipped:
+            return ToolResult(
+                name="command_audit",
+                success=True,
+                content=format_audit_observation(audit),
+            )
+        return None
 
     def run(self, goal: str, continue_session: bool = False) -> AgentResult:
         if continue_session and self._transcript:
@@ -2027,6 +2099,7 @@ class Agent:
             self._memory_block = ""
             self._failure_streak = []
             self._self_heal_fired = 0
+            self._pending_audit = {}
             # Per-goal augmentor injection: ask the optional callback for
             # a system-prompt block tailored to this goal. Empty string =
             # no injection (e.g. plain Python codegen with no keyword
@@ -2571,6 +2644,15 @@ class Agent:
                     results.append(verify)
                     self._tool_results.append(verify)
                     self._emit(AgentEvent("tool_result", iteration, verify))
+
+                # Post-execution destructive-command audit (no-op unless this
+                # call was an approved destructive run_bash with a pending
+                # pre-execution snapshot). Threads the real filesystem delta.
+                audit = self._maybe_audit_destructive(call, result)
+                if audit is not None:
+                    results.append(audit)
+                    self._tool_results.append(audit)
+                    self._emit(AgentEvent("tool_result", iteration, audit))
 
             # Surface parser errors as synthetic tool results so the model
             # sees "your malformed call didn't run" and can retry with
