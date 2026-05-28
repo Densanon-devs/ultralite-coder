@@ -69,6 +69,17 @@ class BaseModel:
                 n_gpu_layers=self.config.gpu_layers,
                 n_threads=self.config.threads,
                 n_batch=self.config.batch_size,
+                # flash_attn: O(n²) → O(n) memory + compute on the
+                # attention pass. Measured win on Qwen 2.5 Coder 14B
+                # Q4_K_M / RTX 3060 / llama-cpp-python 0.3.20
+                # (smoke_flash_attn_bench.py, 2026-05-28):
+                #   Cold prompt eval (~3850 input tokens):  85.0s → 10.8s  (-87%)
+                #   Warm decode (200 tokens):                7.5s → 6.6s   (-12%)
+                # Cold-cache turns are the first turn of every agent
+                # goal; warm-cache turns are every subsequent turn.
+                # Mathematically equivalent reorder of the attention
+                # computation — zero quality regression risk.
+                flash_attn=True,
                 verbose=logger.isEnabledFor(logging.DEBUG),
             )
 
