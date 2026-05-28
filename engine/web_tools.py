@@ -8,8 +8,16 @@ mode (no --web flag) keeps the zero-server invariant from CLAUDE.md.
 
 Stdlib only — urllib + html.parser. No new dependencies.
 
-Privacy guard: fetch_url blocks SSRF targets (file://, localhost, RFC1918,
-loopback, link-local, multicast). Response bodies are size-capped.
+Privacy guards (in order of execution):
+  1. SSRF gate: blocks file://, localhost, RFC1918, loopback,
+     link-local, multicast (in this module — _is_safe_url).
+  2. Egress content gate: blocks URLs embedding API keys, auth tokens,
+     presigned signatures, JWTs (densanon.core.egress_gate).
+     Defends against the Copilot-Cowork attack class where prompt
+     injection coerces the agent into exfiltrating a secret it has in
+     working context via an outbound URL parameter.
+  3. risky=True per-call y/N confirmation (in agent loop).
+  4. Response bodies are size-capped.
 """
 from __future__ import annotations
 
@@ -17,6 +25,7 @@ import gzip
 import html
 import io
 import ipaddress
+import logging
 import re
 import socket
 import urllib.error
@@ -24,6 +33,8 @@ import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 from typing import Optional
+
+logger = logging.getLogger("ulcagent.web_tools")
 
 DEFAULT_USER_AGENT = "ulcagent/1.0 (+https://github.com/densanon-devs/ultralight-coder)"
 DEFAULT_TIMEOUT = 15
@@ -202,6 +213,38 @@ def _http_get(
 
 # ── fetch_url ────────────────────────────────────────────────────────────────
 
+def _check_egress(url: str) -> None:
+    """Run the densanon-core egress gate on the URL. Raise WebToolError
+    on high/medium-severity matches (API keys, presigned URLs, etc.).
+    Log a warning on low-severity (heuristic) matches without blocking.
+
+    Lazy-imports densanon.core.egress_gate so a missing densanon-core
+    install only loses the egress protection — fetch_url still works.
+    """
+    try:
+        from densanon.core.egress_gate import check_url
+    except ImportError:
+        logger.warning(
+            "densanon.core.egress_gate not available — outbound URLs "
+            "are not being scanned for embedded secrets")
+        return
+    v = check_url(url)
+    if v is None:
+        return
+    if v.severity in ("high", "medium"):
+        raise WebToolError(
+            f"egress gate refused outbound URL: {v.description} "
+            f"({v.redacted_text}, pattern={v.pattern_id}, "
+            f"severity={v.severity}). "
+            f"This URL appears to embed a secret/auth token. If this "
+            f"is intentional and the value is NOT actually a credential, "
+            f"the URL needs to be rewritten without it.")
+    # severity == "low" → warn only
+    logger.warning(
+        f"egress gate flagged outbound URL (heuristic, not blocked): "
+        f"{v.description} ({v.redacted_text}, pattern={v.pattern_id})")
+
+
 def fetch_url(
     url: str,
     *,
@@ -229,6 +272,9 @@ def fetch_url(
     ok, reason = _is_safe_url(url)
     if not ok:
         raise WebToolError(f"refusing to fetch {url!r}: {reason}")
+    # Egress content gate: scan URL for embedded secrets BEFORE the
+    # network call fires. Blocks the Copilot-Cowork class of attack.
+    _check_egress(url)
     body, content_type = _http_get(url, timeout=timeout)
     if raw or "html" not in content_type.lower():
         text = body
