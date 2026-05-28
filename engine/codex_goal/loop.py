@@ -17,7 +17,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from .prompts import BUDGET_LIMIT_PROMPT, CONTINUATION_PROMPT, DONE_SENTINEL
+from .prompts import (
+    ACCEPTANCE_RETRY_PROMPT,
+    BUDGET_LIMIT_PROMPT,
+    CONTINUATION_PROMPT,
+    DONE_SENTINEL,
+)
 
 
 # Default-ish token budget: 50k tokens is roughly 6-10 iterations on
@@ -90,6 +95,8 @@ def run_goal_loop(
     token_budget: int = DEFAULT_TOKEN_BUDGET,
     max_loops: int = DEFAULT_MAX_ITERATIONS,
     on_iteration: Callable[[GoalIteration], None] | None = None,
+    acceptance_check: Callable[[], str | None] | None = None,
+    acceptance_max_retries: int = 2,
 ) -> GoalResult:
     """Run `agent` against `goal` until the model self-evaluates completion.
 
@@ -112,6 +119,20 @@ def run_goal_loop(
     on_iteration
         Optional callback invoked with each `GoalIteration` as it
         completes — useful for live progress display in the CLI.
+    acceptance_check
+        Optional objective gate on completion. When the model emits the
+        `GOAL_COMPLETE` sentinel, this callback runs; if it returns a
+        non-empty string (the goal is NOT actually met — e.g. mission steps
+        still pending, tests failing), that feedback is fed back into the
+        session and the loop keeps going instead of accepting completion.
+        Returning None/empty accepts the completion. Default None preserves
+        the original sentinel-only behavior exactly. Mirrors
+        `Agent.pre_finish_check` so the same gate can govern both the
+        one-shot and persistent-loop completion boundaries.
+    acceptance_max_retries
+        Hard cap on how many times `acceptance_check` may reject a
+        `GOAL_COMPLETE`. Past this, the sentinel is accepted as-is so a
+        check that never passes can't trap the loop. Default 2.
 
     Returns
     -------
@@ -121,6 +142,7 @@ def run_goal_loop(
     result = GoalResult(goal=goal)
     tokens_used = 0
     iteration_index = 0
+    acceptance_retries = 0
 
     # Iteration 1: feed the original goal as a fresh session.
     current_prompt = goal
@@ -166,6 +188,31 @@ def run_goal_loop(
 
         # Completion check: has the model self-evaluated to GOAL_COMPLETE?
         if _is_completion(answer):
+            # Objective acceptance gate. The inner agent.run already gates
+            # each iteration's final answer (syntax/goal-token sweeps), but
+            # the *outer* loop has historically trusted the sentinel alone.
+            # If an acceptance_check is wired and still has retries left, let
+            # it veto a premature GOAL_COMPLETE and keep the loop running.
+            feedback: str | None = None
+            if (
+                acceptance_check is not None
+                and acceptance_retries < acceptance_max_retries
+                and iteration_index < max_loops
+            ):
+                try:
+                    feedback = acceptance_check()
+                except Exception:
+                    feedback = None
+            if feedback:
+                acceptance_retries += 1
+                current_prompt = ACCEPTANCE_RETRY_PROMPT.format(
+                    goal=goal,
+                    feedback=feedback,
+                    retry=acceptance_retries,
+                    max_retries=acceptance_max_retries,
+                )
+                continue_session = True
+                continue
             result.completed = True
             result.stop_reason = "completed"
             result.final_summary = answer

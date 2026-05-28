@@ -28,6 +28,17 @@ CONTINUATION_PROMPT = (
     "Do not claim completion just to exit the loop."
 )
 
+ACCEPTANCE_RETRY_PROMPT = (
+    "You replied `" + DONE_SENTINEL + "`, but an objective acceptance check "
+    "says the goal is NOT actually complete yet:\n"
+    "<check_failed>\n{feedback}\n</check_failed>\n\n"
+    "The persistent goal is:\n"
+    "<goal>\n{goal}\n</goal>\n\n"
+    "Do NOT declare completion again until the issue above is resolved. "
+    "Address it now using your tools, then re-evaluate. "
+    "(acceptance retry {retry}/{max_retries})"
+)
+
 BUDGET_LIMIT_PROMPT = (
     "Token budget exhausted. The persistent goal was:\n"
     "<goal>\n{goal}\n</goal>\n\n"

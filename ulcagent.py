@@ -1328,9 +1328,16 @@ def _run_goal_loop(agent, persistent_goal: str):
         print()
         _spinner.start()
 
+    # Honor the agent's own completion gate at the OUTER loop boundary too.
+    # The one-shot path passes pre_finish_check into Agent(...) (e.g. the
+    # mission anti-abandon nudge); without this, the persistent /goal loop
+    # would accept GOAL_COMPLETE on the model's say-so even while that gate
+    # would have rejected it. None (no gate wired) → unchanged behavior.
+    acceptance_check = getattr(agent, "pre_finish_check", None)
+
     _spinner.start()
     try:
-        result = run_goal_loop(agent, persistent_goal)
+        result = run_goal_loop(agent, persistent_goal, acceptance_check=acceptance_check)
     finally:
         _spinner.stop()
 
