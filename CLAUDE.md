@@ -171,6 +171,18 @@ Three mechanisms that make 0.5B models competitive:
 
 ### Agent Mode (engine/agent.py + agent_tools.py + agent_builtins.py + agent_memory.py)
 
+**Terminology** (per the Hugging Face agent glossary, [blog](https://huggingface.co/blog/agent-glossary), 2026-05-28). When debugging an ulcagent failure, naming the layer matters:
+
+| Term | What it is | Where in this codebase |
+|---|---|---|
+| **Scaffold** | The system prompt + tool descriptions + context management — *what the model sees* | YAML augmentors in `data/augmentor_examples/` + `engine/agent.py` system prompt + the `<tools>` block emitted from `agent_tools.py` |
+| **Harness** | The execution loop + tool-call routing + stop logic + guardrails — *how the agent runs* | `engine/agent.py::Agent.run()` + `_execute_call` + `destructive_command_gate` + `self_heal` + `command_audit` |
+| **Tool** | A single-action function the model can invoke | `engine/agent_tools.py` + `engine/agent_builtins.py` (10 core + 11 extended) |
+| **Agent** | Model + Harness as one running unit | `Agent(model=..., registry=...)` |
+| **Skill** | A reusable multi-step bundle, distinct from a single Tool | Not implemented in ulcagent today; `data/augmentor_examples/` YAMLs are the closest analog (multi-step patterns shown via few-shot demos) |
+
+So when a failure surfaces: ask **scaffold problem** (bad system prompt / wrong context) vs **harness problem** (bad tool routing / stop logic) vs **model problem** (the 14B's own ceiling — see Known Ceilings). The right fix depends on which layer is broken; mis-attributing scaffold problems to the harness is a common debugging waste.
+
 Phase 14 ReAct loop. The agent is **loader-agnostic** — it accepts any object with a `.generate(prompt, max_tokens, stop)` method, so the same `Agent` class works against the loaded `BaseModel`, against stub models in unit tests, and against any future inference backend.
 
 **Loop:** Build ChatML prompt from running transcript → `model.generate()` → parse `<tool_call>` tags → if none, that's the final answer; if any, execute every call (with risky-confirm hook), append tool results as a `<|im_start|>tool` turn with Hermes `<tool_response>` blocks, repeat. Budgets: `max_iterations=20`, `max_wall_time=600s`, `max_tokens_per_turn=1024`.
@@ -379,6 +391,8 @@ The model excels at **targeted edits** to existing files — reading 20-line fun
 **File size limit:** Files over ~200 lines should be read in sections (`read_file` with `offset`/`limit`), or use `read_function` (extended tools) to extract specific functions by name.
 
 **Tool count:** The lean 10-tool registry scores 100% on benchmarks. The extended 21-tool set drops to ~86% because the extra schemas consume context and confuse the 14B. Use `--extended` only when you need git/rename/checkpoint tools and are guiding the agent step by step.
+
+The 10-vs-21 tool drop is one instance of a more general phenomenon — the **observability paradox**: giving an LLM agent *more* context/options at decision time degrades performance vs. concise targeted context. Academic backing: IBM Research + Artificial Analysis ITBench-AA (Hugging Face 2026-05-28, [blog](https://huggingface.co/blog/ibm-research/itbench-aa)) benchmarked frontier models on 59 Kubernetes SRE incident-response tasks and found models taking **more turns score LOWER** (30% pass at ~83 turns vs 37% pass at ~58 turns). The same shape as ulcagent's tool-count regression. The `--extended` gate (off by default) is the right design response: extra capability is opt-in, not the floor. See also `feedback_tool_count_regression.md` in memory.
 
 **Non-Qwen models:** Only Qwen 2.5 family models support the Hermes `<tool_call>` format natively. Gemma 4 was tested and scored 30% (rejected). Future models need Hermes-format fine-tuning or a per-model adapter.
 
