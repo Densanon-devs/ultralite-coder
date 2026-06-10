@@ -1179,3 +1179,62 @@ The **Rust `impl ` check was a real bug** — it required a literal space after 
 60. **Large-mode gating was two separate bugs disguised as one feature.** The testing/data allowlist correctly handled Python queries (augmentors hurt 14B there). But it silently disabled augmentors for all non-Python queries — a completely different failure mode where the 14B actually needs the scaffolding because pretraining coverage is thinner. Splitting the logic into "Python non-testing → skip, Python testing/data → keep, non-Python → keep with language-scoped retrieval" fixes both.
 
 61. **The symmetric fix closes the gap to the small-model baseline.** 0.5B–3B full stack on V1+V2: 200/200. 14B auto+scoping on V1+V2: 198/200. 0.5B–3B on multi-lang: 129/130. 14B scoping+hardened on multi-lang: 127–128/130. A single retrieval-layer fix brought both 14B models within 1–2 queries of the Phase 10 baseline across both benchmarks — matching the small-model stack via a completely different mechanism.
+
+---
+
+# Gauntlet Design Note: Held-out OOD Partition + Stage-level Decomposition (planned)
+
+**Date:** 2026-06-09
+**Status:** Design only — not implemented. Jordan decides when to build.
+
+## Why the current gauntlet is saturated
+
+V1+V2 is at 198/200 (99.0%) on Qwen 2.5 Coder 14B. The multi-language bench sits at 127–128/130 (97.7–98.5%). The agentic 13-task bench is at 100% at --repeat 2 with the lean registry. Scores at this ceiling no longer discriminate between model swaps or augmentor changes — a swap that is genuinely worse by 3–4% will register as noise. Additional gains require a gauntlet that exposes failure modes that are invisible in the current benchmarks.
+
+## Failure-mode taxonomy — arXiv 2606.07718
+
+A 2025 case study on evaluating AI coding agents against a real neuroscience data-to-discovery pipeline (arXiv:2606.07718) found that general-purpose coding agents succeed at individual pipeline stages but systematically fail end-to-end. The paper names five concrete failure modes. Mapping them to ULC:
+
+| # | Paper failure mode | ULC equivalent |
+|---|---|---|
+| 1 | **Inability to iterate without pre-defined criteria** | The `self_heal` augmentor + retry loops. When the agent's verification signal is absent or ambiguous, it either bails early (`premature_bail` detector) or loops without making progress (`stuck_repeat_loop` detector). V1+V2 don't probe this because each query has a single clean correct answer — iteration is never required. |
+| 2 | **Poor scientific judgment** | Multi-step refactor decisions: choosing between ABC vs Protocol, SQL DDL vs Python class wrapper, contextmanager vs `__enter__`/`__exit__`. The 2 residual coder-14b failures on V1+V2 are both judgment calls of this type. No current bench scores judgment quality — only outcome correctness. |
+| 3 | **Visual inspection interpretation** | Not directly applicable to a CLI coding assistant. ULC has no visual output path. Skip. |
+| 4 | **Compute resource management** | Tool-budget and context-window discipline. The agentic bench at 28/28 uses a lean 10-tool registry specifically because the extended 21-tool set drops to ~86% (tool count is a resource-management problem at 14B). A harder bench should include tasks that require selective tool use under a strict iteration budget. |
+| 5 | **Generalization failure on large held-out datasets** | The OOD partition described below. |
+
+The paper's reusable methodological contribution: **stage-level decomposition** — score each pipeline stage independently against domain-expert standards, rather than only scoring end-to-end pass/fail. The current V1+V2 checker is end-to-end only: code runs or it doesn't. Stage decomposition would tell us which stage (plan / locate / edit / verify / iterate) dominates failures on the cases that do fail.
+
+## Proposed: held-out OOD partition
+
+A set of 20–30 problems held out at design time — never seen during detector tuning, augmentor development, or check hardening. Distinct from V1/V2/V3/V4.
+
+**Design constraints:**
+- Assembled in one batch, sealed. No incremental additions while augmentors are evolving.
+- Problems drawn from domains that are *adjacent* to V1+V2 but not represented in the training distribution of YAMLs — e.g., concurrent data structure modifications, multi-file refactors with circular dependency risk, YAML/TOML schema migrations, embedded SQL + Python layered edits.
+- Checkers written against the *intended outcome*, not against specific token strings (no literal keyword checks). Prefer: "does the test suite pass?", "does the file parse clean?", "is the invariant preserved?".
+- Scored once per candidate model or augmentor release, not per commit.
+
+**What this answers:** Is the bench co-evolved with the system? A system that achieves 198/200 on V1+V2 but only 14/30 on the OOD partition is over-indexed on the training distribution of its own augmentors. A system that achieves 198/200 and 25/30 is genuinely generalizing.
+
+## Proposed: stage-level decomposition scoring
+
+For multi-stage agentic tasks, score each stage independently:
+
+| Stage | What it measures |
+|---|---|
+| **plan** | Does the agent produce a coherent decomposition before touching files? |
+| **locate** | Does it find the correct file(s) and function(s) without false positives? |
+| **edit** | Does the edit succeed on first attempt (`edit_file` returns success)? |
+| **verify** | Does the agent call `run_tests` or `auto_verify` and interpret the result correctly? |
+| **iterate** | When verification fails, does it recover without hitting `stuck_repeat_loop`? |
+
+A task can score 5/5 (clean end-to-end) or, for example, 3/5 (locate + edit + verify succeed; plan was absent; iterate was never needed). Aggregating stage scores across the OOD partition tells us whether the dominant failure mode is planning discipline, edit precision, or recovery under failure — and which of those is the binding constraint on a given model.
+
+This complements the existing `failure_flagger.py` taxonomy (which fires at run time) with a pre-structured evaluation lens that can be applied consistently across model swaps.
+
+## Implementation notes (for when Jordan decides to build)
+
+- No changes to `benchmark_agentic.py` or the detector files. This is a new `benchmark_ood.py` + a `data/ood_problems/` directory.
+- The OOD problems should be authored by Jordan (not auto-generated), so there is no leakage from the model's training distribution into problem design.
+- Stage-level scoring requires a thin wrapper that instruments the agent's tool call log and maps calls to stage labels. The agent already emits a full transcript — a read-only post-run analyzer over that transcript is sufficient. No changes to `engine/agent.py`.
