@@ -81,6 +81,11 @@ class AgentResult:
     # works with stub models) but consistent run-to-run — meant for RELATIVE
     # comparison, e.g. ranking which failure modes waste the most tokens.
     est_tokens: int = 0
+    # GBNF A/B instrumentation (additive). All default 0 so legacy callers
+    # that build AgentResult positionally/partially are unaffected.
+    parse_errors_total: int = 0   # tool-call parse errors across all turns (pre-recovery)
+    json_recovery_fired: int = 0  # how many times the opt-in json_recovery pass ran
+    grammar_turns: int = 0        # tool-call turns that ran with a GBNF grammar attached
 
 
 # ── System prompt ───────────────────────────────────────────────
@@ -271,6 +276,24 @@ class Agent:
         # finding is preserved — empty return on non-matching goals.
         augment_for_goal: Optional[Callable[[str], str]] = None,
         on_event: Optional[Callable[[AgentEvent], None]] = None,
+        # Session-complexity monitor (opt-in). When provided, fires a
+        # proactive compaction pass before each model call based on
+        # cumulative tool-call depth and tool-output volume — earlier than
+        # the reactive context_char_budget ceiling. See
+        # engine/complexity_monitor.py and test_complexity_monitor.py.
+        # Default None = monitor disabled (legacy / baseline behavior preserved).
+        complexity_monitor: Optional[Any] = None,
+        # GBNF-constrained tool-call decoding (opt-in, default OFF).
+        # When set to a parsed `LlamaGrammar` (or anything llama-cpp's
+        # generate() accepts as `grammar=`), it's added to the per-turn
+        # tool-call gen_kwargs so the model's output is constrained to a
+        # valid Hermes `<tool_call>{...}</tool_call>` with escaped-newline
+        # JSON by construction. Proven single-shot in test_gbnf_toolcall_ab.py
+        # to force valid JSON on the multi-line-content ceiling. Default None
+        # = unconstrained free-form decoding (byte-for-byte the legacy path).
+        # The grammar is built once by the caller (ulcagent / the A/B harness)
+        # and threaded through unchanged — the Agent never parses GBNF itself.
+        tool_call_grammar: Optional[Any] = None,
     ) -> None:
         self.model = model
         self.registry = registry
@@ -301,6 +324,12 @@ class Agent:
         self.pre_finish_check = pre_finish_check
         self.pre_finish_max_retries = max(0, int(pre_finish_max_retries))
         self.augment_for_goal = augment_for_goal
+        self.complexity_monitor = complexity_monitor
+        # Opt-in GBNF tool-call grammar (None = unconstrained, legacy default).
+        self.tool_call_grammar = tool_call_grammar
+        # How many tool-call generate() turns ran with the grammar attached
+        # this run — surfaced for the A/B so ON/OFF is verifiable, not assumed.
+        self._grammar_turns: int = 0
         self.context_char_budget = int(context_char_budget)
         self.compact_keep_recent = max(2, int(compact_keep_recent))
         self._compactions: int = 0  # how many compaction passes fired this run
@@ -327,6 +356,9 @@ class Agent:
         # for the A/B so a 0-firing result is distinguishable from a 0-help one.
         self._json_recovery_fired: int = 0
         self._json_recovery_recovered: int = 0
+        # Total tool-call parse errors observed across all turns this run
+        # (counted pre-recovery). Surfaced on AgentResult for the GBNF A/B.
+        self._parse_errors_total: int = 0
 
     # ── json recovery ──
 
@@ -2099,6 +2131,10 @@ class Agent:
             self._memory_block = ""
             self._failure_streak = []
             self._self_heal_fired = 0
+            self._parse_errors_total = 0
+            self._grammar_turns = 0
+            self._json_recovery_fired = 0
+            self._json_recovery_recovered = 0
             self._pending_audit = {}
             # Per-goal augmentor injection: ask the optional callback for
             # a system-prompt block tailored to this goal. Empty string =
@@ -2148,6 +2184,15 @@ class Agent:
 
             self._emit(AgentEvent("iteration", iteration))
 
+            # Proactive complexity compaction (opt-in via complexity_monitor).
+            # Fires BEFORE the reactive context_char_budget ceiling when the
+            # session's tool-call depth or accumulated tool-output volume
+            # exceeds the configured thresholds. This addresses distractor
+            # accumulation (the Stroop-effect failure mode in long chains)
+            # independently of raw prompt size. See engine/complexity_monitor.py.
+            if self.complexity_monitor is not None:
+                self.complexity_monitor.maybe_compact(self)
+
             # Compact the transcript before building the next prompt.
             # Fires only when the rendered size exceeds context_char_budget;
             # cheap to call every iteration because the common case is a
@@ -2173,6 +2218,12 @@ class Agent:
                     gen_kwargs["temperature"] = self.temperature
                 if self.repeat_penalty is not None:
                     gen_kwargs["repeat_penalty"] = self.repeat_penalty
+                # Opt-in GBNF constraint on the tool-call turn. No-op when
+                # tool_call_grammar is None (legacy default) — the kwarg isn't
+                # even added, so the generate() call is byte-for-byte unchanged.
+                if self.tool_call_grammar is not None:
+                    gen_kwargs["grammar"] = self.tool_call_grammar
+                    self._grammar_turns += 1
                 response = self.model.generate(prompt, **gen_kwargs)
             except Exception as exc:
                 logger.exception("Model generation failed during agent loop")
@@ -2185,6 +2236,11 @@ class Agent:
             self._emit(AgentEvent("model_text", iteration, response))
 
             calls, parse_errors = self.registry.parse_with_errors(response)
+            # Count tool-call parse errors seen this run (pre-recovery). A
+            # parse error means the model emitted tool-call-shaped text whose
+            # JSON the parser couldn't turn into a call — the burden the GBNF
+            # A/B is measuring. Additive instrumentation only.
+            self._parse_errors_total += len(parse_errors)
 
             # JSON parse-failure recovery (opt-in via json_recovery=True).
             # Fires only when the model clearly ATTEMPTED a tool call but the
@@ -2724,6 +2780,9 @@ class Agent:
             compactions=self._compactions,
             self_heals=self._self_heal_fired,
             est_tokens=round(self._gen_chars / 3.25),
+            parse_errors_total=self._parse_errors_total,
+            json_recovery_fired=self._json_recovery_fired,
+            grammar_turns=self._grammar_turns,
         )
 
 

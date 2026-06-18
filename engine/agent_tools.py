@@ -145,6 +145,33 @@ _LENIENT_JSON = json.JSONDecoder(strict=False)
 _INVALID_ESCAPE_RE = re.compile(r'\\([^"\\/bfnrtu])')
 
 
+# ── Repair-tier instrumentation (additive, off the hot path) ─────────
+# Module-level counters bumped by _decode_with_repair when it has to go
+# BEYOND the strict/lenient Tier-1 decode. This is the precise "repair
+# burden" signal for the GBNF A/B: when the grammar is ON, every tool-call
+# body is valid by construction, so Tier-1 always succeeds and these stay 0.
+# Tier-1 (strict/lenient) is NOT counted — it's the baseline success path,
+# not a repair. Nothing here changes any return value or LLM-facing string.
+_REPAIR_TIER_COUNTS: dict[str, int] = {
+    "tier2_escape": 0,        # invalid-escape stripping
+    "tier3_extra_brace": 0,   # trailing `}}}` recovery
+    "tier4_truncated": 0,     # max_tokens mid-array truncation recovery
+    "tier5_literal_eval": 0,  # Python-literal (mixed-quote) fallback
+    "decode_failed": 0,       # all tiers exhausted, returned None
+}
+
+
+def reset_repair_tier_counts() -> None:
+    """Zero the repair-tier instrumentation counters (call before a run)."""
+    for k in _REPAIR_TIER_COUNTS:
+        _REPAIR_TIER_COUNTS[k] = 0
+
+
+def get_repair_tier_counts() -> dict[str, int]:
+    """Snapshot of how many times each post-Tier-1 repair path fired."""
+    return dict(_REPAIR_TIER_COUNTS)
+
+
 def _repair_json_body(body: str) -> str:
     """
     Fix common JSON-invalid escape sequences the model emits inside string
@@ -183,20 +210,25 @@ def _decode_with_repair(body: str) -> Optional[dict]:
     # Tier 2: escape repair
     if "escape" in err_msg:
         try:
-            return _LENIENT_JSON.decode(_repair_json_body(body))
+            result = _LENIENT_JSON.decode(_repair_json_body(body))
         except json.JSONDecodeError:
             pass
+        else:
+            _REPAIR_TIER_COUNTS["tier2_escape"] += 1
+            return result
     # Tier 3: extra-trailing-brace recovery. Only fires on "Extra data"
     # errors to avoid shadowing other decode failures.
     if "Extra data" in err_msg:
         obj = _try_extra_brace_recovery(body)
         if obj is not None:
+            _REPAIR_TIER_COUNTS["tier3_extra_brace"] += 1
             return obj
         # Also retry with escape repair applied
         repaired = _repair_json_body(body)
         if repaired != body:
             obj = _try_extra_brace_recovery(repaired)
             if obj is not None:
+                _REPAIR_TIER_COUNTS["tier3_extra_brace"] += 1
                 return obj
     # Tier 4: Truncated content-array recovery. When max_tokens cuts the
     # model's output mid-string inside a content array like
@@ -208,6 +240,7 @@ def _decode_with_repair(body: str) -> Optional[dict]:
     if "Unterminated" in err_msg or "Expecting" in err_msg:
         recovered = _try_truncated_array_recovery(body)
         if recovered is not None:
+            _REPAIR_TIER_COUNTS["tier4_truncated"] += 1
             return recovered
 
     # Tier 5: Python literal fallback — handles mixed `'...'` + `"..."`
@@ -222,6 +255,7 @@ def _decode_with_repair(body: str) -> Optional[dict]:
         pass
     else:
         if isinstance(obj, dict):
+            _REPAIR_TIER_COUNTS["tier5_literal_eval"] += 1
             return obj
     # Also try the literal eval on the repaired body in case both escape
     # errors AND mixed quotes are present simultaneously.
@@ -234,7 +268,9 @@ def _decode_with_repair(body: str) -> Optional[dict]:
             pass
         else:
             if isinstance(obj, dict):
+                _REPAIR_TIER_COUNTS["tier5_literal_eval"] += 1
                 return obj
+    _REPAIR_TIER_COUNTS["decode_failed"] += 1
     return None
 
 
