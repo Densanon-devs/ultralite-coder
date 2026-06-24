@@ -60,6 +60,16 @@ class FrontDoorMatch:
 # Word-boundary identifier (the unit a rename moves).
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 
+# Placeholder/pronoun words that are NEVER a real rename source. "rename it to
+# bar" / "rename the thing to processor" have no concrete target identifier —
+# the user means "the thing we were just discussing", which needs the model.
+# Renaming the literal token `it`/`thing` across the codebase would be silent
+# corruption, so these abstain. (Applies to the OLD identifier only.)
+_PLACEHOLDER_IDENTS = frozenset((
+    "it", "this", "that", "thing", "stuff", "something", "anything",
+    "everything", "them", "these", "those", "one", "ones", "above", "below",
+))
+
 # Phrases that signal a GENERATIVE request — if any appears, abstain hard.
 # These mean "the model has to write/understand logic", which is exactly what
 # the front-door must NOT attempt.
@@ -190,6 +200,10 @@ class DeterministicFrontDoor:
         if not (_IDENT_RE.match(old) and _IDENT_RE.match(new)):
             return None
         if old == new:
+            return None
+        # A pronoun/placeholder as the source means the real target is
+        # implicit ("rename it to bar") — abstain, the model must resolve it.
+        if old.lower() in _PLACEHOLDER_IDENTS:
             return None
         return _RenamePlan(old=old, new=new)
 
