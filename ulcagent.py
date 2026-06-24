@@ -1608,7 +1608,31 @@ def _print_help():
     print(text)
 
 
-def _run_one(agent, goal: str, continue_session: bool = False):
+def _maybe_frontdoor(goal: str, workspace: Path):
+    """Opt-in deterministic front-door (default OFF, --frontdoor to enable).
+
+    Routes trivially-mechanical requests (pure rename, add top-level import,
+    format a file, trailing-newline fix, bare empty-file create) AROUND the
+    14B entirely — zero model inference. Returns a FrontDoorMatch on a
+    confident deterministic handling, else None (abstain → normal agent loop
+    runs unchanged). The flag check makes the default path byte-for-byte the
+    legacy path. See engine/deterministic_frontdoor.py."""
+    if "--frontdoor" not in sys.argv:
+        return None
+    try:
+        from engine.deterministic_frontdoor import DeterministicFrontDoor
+        fd = DeterministicFrontDoor(workspace)
+        return fd.try_handle(goal)
+    except Exception:
+        # The front-door must never break the normal flow — any failure
+        # silently defers to the model.
+        return None
+
+
+def _run_one(agent, goal: str, continue_session: bool = False, workspace: Path = None):
+    # `workspace` is accepted for call-site symmetry; the deterministic
+    # front-door is checked by the callers BEFORE model load (so a mechanical
+    # goal never loads the 14B), not here.
     if goal in ("?", "help"):
         _print_help()
         return None
@@ -1723,10 +1747,17 @@ def main():
     goal_args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if goal_args:
         goal = " ".join(goal_args)
+        # Deterministic front-door first (opt-in): if it handles the goal we
+        # never load the 14B at all — the whole point of routing around it.
+        fd_match = _maybe_frontdoor(goal, workspace)
+        if fd_match is not None:
+            tag = _dim("[frontdoor:no-op]") if fd_match.no_op else _green("[frontdoor]")
+            print(f"  {tag} {fd_match.summary}")
+            return
         profile = _detect_profile(goal)
         mgr.ensure_profile(profile)
         agent = _build_agent(mgr, workspace)
-        _run_one(agent, goal)
+        _run_one(agent, goal, workspace=workspace)
         mgr.unload()
         return
 
@@ -1934,6 +1965,17 @@ def main():
         elif goal.startswith("/general "):
             forced_profile = "general"
             goal = goal[9:].strip()
+
+        # Deterministic front-door (opt-in, default OFF). Runs BEFORE any
+        # model load/swap so a mechanical goal never touches the 14B. Abstains
+        # (returns None) for anything generative → falls through unchanged.
+        fd_match = _maybe_frontdoor(goal, workspace)
+        if fd_match is not None:
+            tag = _dim("[frontdoor:no-op]") if fd_match.no_op else _green("[frontdoor]")
+            print(f"  {tag} {fd_match.summary}")
+            _session_log.append({"role": "user", "content": goal})
+            _session_log.append({"role": "agent", "content": fd_match.summary, "stats": "frontdoor"})
+            continue
 
         # Auto-detect or use forced profile
         profile = forced_profile or _detect_profile(goal)
