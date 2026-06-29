@@ -267,6 +267,15 @@ def _build_agent(mgr: ModelManager, workspace: Path):
     # checks (curl|sh, command-lifted-from-output) STILL fire. See
     # engine/supply_chain_gate.py.
     trust_repo = "--trust-repo" in sys.argv
+    # `--review`: reviewable staged edits ("human-agent-in-the-loop"). Before
+    # each mutating file edit is written to disk, show the EXACT unified diff
+    # and prompt y/N. Orthogonal to --yes (which auto-approves *risky* tools
+    # like run_bash): they compose — `--yes --review` auto-runs shells but
+    # still hand-approves every file edit. Default deny on EOF/Ctrl+C. The
+    # confirm hook sits inside the tool's write path (see
+    # engine.agent_builtins._apply_file_write), so the previewed diff is
+    # byte-identical to what lands on disk.
+    review_edits = "--review" in sys.argv
     # `--toolset NAME` (or `--toolset=NAME`): curated themed tool set
     # (coding/refactor/git/web/full). Authoritative over --extended/--web —
     # keeps the model under the ~10-tool accuracy cliff per task. See
@@ -291,6 +300,40 @@ def _build_agent(mgr: ModelManager, workspace: Path):
     # raises NotImplementedError if used (see engine/mcp_adapter.py).
     # Default = no MCP, identical behavior to before this scaffold landed.
     mcp_servers = _parse_mcp_arg(sys.argv)
+
+    def _confirm_edit(path, old_content, new_content, diff_text):
+        # Reviewable staged edit: show the exact unified diff and prompt
+        # before the bytes land on disk. Default DENY on EOF/Ctrl+C. This is
+        # ulcagent's differentiator — 100% local AND every edit individually
+        # reviewable before it's applied. Orthogonal to --yes (risky tools).
+        _spinner.stop()
+        print()
+        print(f"  {_cyan('[review edit]')} {path}")
+        if diff_text:
+            for ln in diff_text.splitlines():
+                if ln.startswith("+") and not ln.startswith("+++"):
+                    print(f"    {_green(ln)}")
+                elif ln.startswith("-") and not ln.startswith("---"):
+                    print(f"    {_red(ln)}")
+                elif ln.startswith("@@"):
+                    print(f"    {_cyan(ln)}")
+                else:
+                    print(f"    {_dim(ln)}")
+        else:
+            # New file or no line-level diff to show — preview the content.
+            preview = new_content if len(new_content) <= 2000 else (
+                new_content[:2000] + f"\n... ({len(new_content) - 2000} more chars)"
+            )
+            for ln in preview.splitlines():
+                print(f"    {_green('+' + ln)}")
+        try:
+            answer = input(f"  {_yellow('Apply this edit? [y/N]')} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        approved = answer in ("y", "yes")
+        print(f"  {_dim('-> ' + ('applied' if approved else 'rejected'))}")
+        return approved
+
     registry = build_default_registry(
         workspace, memory=memory,
         ask_user_fn=_ask_user,
@@ -299,6 +342,7 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         enable_web=enable_web,
         enable_mission=enable_mission,
         toolset=toolset,
+        confirm_edit=_confirm_edit if review_edits else None,
     )
 
     # Add system tools for the general profile
@@ -1644,6 +1688,10 @@ _HELP_TEXT = """
     --mission       Durable multi-step mission tracking (auto-on if
                     .ulcagent_mission.json exists; survives sessions/compaction)
     --yes           Auto-approve all risky tool calls (unattended runs only)
+    --review        Review each file edit before it's written: shows the exact
+                    diff and prompts y/N (default deny). Composes with --yes:
+                    `--yes --review` auto-runs shells but hand-approves every
+                    edit. Orthogonal to --yes, which only gates risky tools.
     --trust-repo    Vouch for this repo's files: skip the supply-chain gate's
                     repo-content scan (.github/setup.js, .claude hooks,
                     package.json install scripts). curl|sh and commands lifted

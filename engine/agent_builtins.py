@@ -52,6 +52,84 @@ def _diff_preview(before: str, after: str, path: str, max_lines: int = 20) -> st
         omitted = len(lines) - max_lines
         lines = lines[:max_lines] + [f"... ({omitted} more diff lines elided)"]
     return "\n".join(lines)
+
+
+class EditRejected(ValueError):
+    """A reviewable file write was rejected by the human reviewer.
+
+    Subclasses ValueError so ToolRegistry.execute turns it into a clean
+    ToolResult(success=False, error=...) (the same path FileNotFoundError /
+    ValueError take), NOT a logged-as-a-bug traceback. The model sees the
+    error string on its next turn and can revise — this rejection IS the
+    human-in-the-loop feedback signal.
+    """
+
+
+def _apply_file_write(
+    ws: "Workspace",
+    path: str,
+    new_content: str,
+    *,
+    confirm_edit: Optional[Callable] = None,
+    is_new: bool = False,
+) -> None:
+    """The single write syscall for every mutating *file* tool.
+
+    LOAD-BEARING INVARIANT: the diff shown to the reviewer is byte-identical
+    to what lands on disk, because both are derived from the SAME `new_content`
+    the tool already computed. The confirmation sits HERE — after the tool's
+    own forgiving content-computation logic (edit_file's append/prepend/cycle
+    routing, write_file's content+new_string merge, insert_at_line's splice),
+    immediately before `write_text`. There is no separate re-derivation that
+    could drift from the tool's real behavior, so preview == applied always.
+
+    Behavior:
+    - `confirm_edit is None` (default): writes immediately. Byte-for-byte the
+      legacy behavior — no preview, no prompt. Every existing return string is
+      unchanged because the caller still builds it.
+    - `confirm_edit` set: reads the current on-disk content (empty when
+      `is_new`), builds the FULL unified diff (uncapped — the reviewer must see
+      the whole change), and calls
+      `confirm_edit(path, old_content, new_content, diff_text)`. Writes only on
+      a truthy return. On a falsy return — or if the callback raises (matching
+      the fail-safe contract of the other gates: a raising callback is treated
+      as a denial) — raises `EditRejected` and writes NOTHING.
+
+    No-op write guard: if the new content equals the current content there's
+    nothing to review, so it writes (a no-op) without prompting.
+    """
+    p = ws.resolve(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    if confirm_edit is None:
+        p.write_text(new_content, encoding="utf-8")
+        return
+
+    old_content = "" if is_new else (
+        p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+    )
+    if old_content == new_content:
+        # Nothing actually changes on disk — no edit to review.
+        p.write_text(new_content, encoding="utf-8")
+        return
+
+    # FULL diff (no max_lines cap) so the reviewer approves the exact bytes,
+    # not a truncated summary. Use the same path string the model passed.
+    diff_text = _diff_preview(old_content, new_content, path, max_lines=10 ** 9)
+    try:
+        approved = bool(confirm_edit(path, old_content, new_content, diff_text))
+    except Exception:
+        logger.exception("confirm_edit callback raised; treating as rejected")
+        approved = False
+    if not approved:
+        raise EditRejected(
+            f"User rejected this edit to {path}. The change was NOT written to "
+            f"disk. Revise your approach (e.g. a smaller/different edit) and "
+            f"try again, or ask the user what they want changed."
+        )
+    p.write_text(new_content, encoding="utf-8")
+
+
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -168,7 +246,8 @@ def _coerce_text(val) -> str:
     return str(val)
 
 
-def _write_file(ws: Workspace, path: str, content=None, new_string=None, **_ignored) -> str:
+def _write_file(ws: Workspace, path: str, content=None, new_string=None,
+                confirm_edit: Optional[Callable] = None, **_ignored) -> str:
     """Write the whole file.
 
     Polymorphic `content`:
@@ -200,7 +279,10 @@ def _write_file(ws: Workspace, path: str, content=None, new_string=None, **_igno
     if not content_str.endswith("\n") and content_str:
         content_str += "\n"
     before = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
-    p.write_text(content_str, encoding="utf-8")
+    _apply_file_write(
+        ws, path, content_str,
+        confirm_edit=confirm_edit, is_new=not p.exists(),
+    )
     # Preserve the legacy "Wrote N chars to X" prefix — the 14B was trained
     # on it and swaps to a different (worse) codegen strategy when it sees
     # anything else. Only append a diff tail on overwrites with changes.
@@ -218,6 +300,7 @@ def _edit_file(
     old_string: str,
     new_string: str,
     replace_all: bool = False,
+    confirm_edit: Optional[Callable] = None,
 ) -> str:
     # `new_string` must be a plain string (use \\n for newlines), NOT an
     # array. Unlike write_file's `content` — where each array element is a
@@ -318,7 +401,7 @@ def _edit_file(
         has_main_guard = 'if __name__' in new_string
         if (has_import_stmt and has_def_or_class) or has_main_guard:
             chunk = new_string if new_string.endswith("\n") else new_string + "\n"
-            p.write_text(chunk, encoding="utf-8")
+            _apply_file_write(ws, path, chunk, confirm_edit=confirm_edit)
             return (
                 f"Rewrote {p} ({len(chunk)} chars) — empty old_string + "
                 f"multi-construct content interpreted as full-file replace. "
@@ -396,7 +479,7 @@ def _edit_file(
                                     + f"{indent}{lazy_line}\n"
                                     + text[header_end:]
                                 )
-                                p.write_text(new_src, encoding="utf-8")
+                                _apply_file_write(ws, path, new_src, confirm_edit=confirm_edit)
                                 return (
                                     f"Inserted lazy import `{lazy_line}` "
                                     f"inside the function in {p} that uses "
@@ -404,7 +487,7 @@ def _edit_file(
                                     f"cyclic import detected (top-level "
                                     f"prepend would have recreated the cycle)."
                                 )
-            p.write_text(chunk + text, encoding="utf-8")
+            _apply_file_write(ws, path, chunk + text, confirm_edit=confirm_edit)
             return (
                 f"Prepended {len(chunk)} chars to {p} (empty old_string + "
                 f"import-only content interpreted as prepend-to-file)."
@@ -417,7 +500,7 @@ def _edit_file(
         # appended block, for readability. Only if the existing file isn't
         # empty.
         gap = "\n" if text.rstrip() else ""
-        p.write_text(text + sep + gap + chunk, encoding="utf-8")
+        _apply_file_write(ws, path, text + sep + gap + chunk, confirm_edit=confirm_edit)
         return (
             f"Appended {len(chunk)} chars to {p} (empty old_string + "
             f"non-import content interpreted as append-to-end)."
@@ -464,14 +547,14 @@ def _edit_file(
             fuzzy_count = text.count(fuzzy)
             if fuzzy_count == 1 and not replace_all:
                 new_text = text.replace(fuzzy, new_string, 1)
-                p.write_text(new_text, encoding="utf-8")
+                _apply_file_write(ws, path, new_text, confirm_edit=confirm_edit)
                 return (
                     f"Replaced 1 occurrence(s) in {p} "
                     f"(fuzzy match: {label})"
                 )
             if fuzzy_count > 0 and replace_all:
                 new_text = text.replace(fuzzy, new_string)
-                p.write_text(new_text, encoding="utf-8")
+                _apply_file_write(ws, path, new_text, confirm_edit=confirm_edit)
                 return (
                     f"Replaced {fuzzy_count} occurrence(s) in {p} "
                     f"(fuzzy match: {label})"
@@ -534,7 +617,7 @@ def _edit_file(
         new_text = text.replace(old_string, new_string)
     else:
         new_text = text.replace(old_string, new_string, 1)
-    p.write_text(new_text, encoding="utf-8")
+    _apply_file_write(ws, path, new_text, confirm_edit=confirm_edit)
     diff = _diff_preview(text, new_text, path)
     tail = f"\n\n{diff}" if diff else ""
     return f"Replaced {count if replace_all else 1} occurrence(s) in {p}{tail}"
@@ -942,6 +1025,7 @@ def build_default_registry(
     enable_web: bool = False,
     enable_mission: bool = False,
     toolset: Optional[str] = None,
+    confirm_edit: Optional[Callable] = None,
 ) -> ToolRegistry:
     """
     Build a ToolRegistry pre-populated with the 8 core Phase 14 agent tools,
@@ -963,6 +1047,18 @@ def build_default_registry(
     the registry crosses ~10 tools (see user-memory
     `feedback_tool_count_regression.md`). Pass e.g.
     `["search_cards", "analyze_deck"]` to mount only those.
+
+    `confirm_edit` (optional, default None): reviewable-edit hook for the
+    "human-agent-in-the-loop" review mode. When set, EVERY mutating *file*
+    tool routes its final write through `_apply_file_write`, which calls
+    `confirm_edit(path, old_content, new_content, diff_text)` immediately
+    before the write syscall and writes ONLY on a truthy return — so the
+    previewed diff is byte-identical to what lands on disk. A falsy return
+    (or a raising callback) rejects the edit: nothing is written and the
+    tool surfaces a `success=False` result the model can react to. Default
+    None preserves byte-for-byte current behavior (writes immediately, no
+    preview). Orthogonal to `--yes`/risky-confirm (which gate run_bash etc.,
+    not edits): the two compose.
     """
     # A named toolset is authoritative on the final tool set: force-register
     # everything it needs (so the tools exist to keep), then prune to it before
@@ -1023,7 +1119,8 @@ def build_default_registry(
             "required": ["path", "content"],
         },
         function=lambda path, content=None, new_string=None, **kw: _write_file(
-            ws, path, content=content, new_string=new_string, **kw
+            ws, path, content=content, new_string=new_string,
+            confirm_edit=confirm_edit, **kw
         ),
         category="file",
     ))
@@ -1049,7 +1146,7 @@ def build_default_registry(
             "required": ["path", "old_string", "new_string"],
         },
         function=lambda path, old_string, new_string, replace_all=False: _edit_file(
-            ws, path, old_string, new_string, replace_all
+            ws, path, old_string, new_string, replace_all, confirm_edit=confirm_edit
         ),
         category="file",
     ))
@@ -1421,7 +1518,7 @@ def build_default_registry(
         before = "".join(lines)
         lines.insert(line - 1, insert_text)
         after = "".join(lines)
-        p.write_text(after, encoding="utf-8")
+        _apply_file_write(ws, path, after, confirm_edit=confirm_edit)
         diff = _diff_preview(before, after, path, max_lines=15)
         tail = f"\n\n{diff}" if diff else ""
         return f"Inserted {len(insert_text)} chars before line {line} in {p}{tail}"
@@ -1574,7 +1671,7 @@ def build_default_registry(
             if old_name not in text:
                 continue
             new_text = text.replace(old_name, new_name)
-            p.write_text(new_text, encoding="utf-8")
+            _apply_file_write(ws, rel, new_text, confirm_edit=confirm_edit)
             count = text.count(old_name)
             changed_files.append(f"{rel} ({count} replacements)")
         if not changed_files:
@@ -1824,7 +1921,7 @@ def build_default_registry(
             elif s and not s.startswith(("import ", "from ", "#", '"""', "'''")):
                 break
         lines.insert(insert_at, statement + "\n")
-        p.write_text("".join(lines), encoding="utf-8")
+        _apply_file_write(ws, path, "".join(lines), confirm_edit=confirm_edit)
         return f"Added '{statement}' at line {insert_at + 1} in {path}"
 
     reg.register(ToolSchema(
@@ -1994,7 +2091,10 @@ def build_default_registry(
                         chunk = [l.rstrip("\n") for l in file_lines[pos:pos + len(removes)]]
                         if chunk == [r.rstrip("\n") for r in removes]:
                             new_lines = file_lines[:pos] + [a + "\n" for a in adds] + file_lines[pos + len(removes):]
-                            current_file.write_text("".join(new_lines), encoding="utf-8")
+                            _apply_file_write(
+                                ws, str(current_file), "".join(new_lines),
+                                confirm_edit=confirm_edit,
+                            )
                             changed_files.append(str(current_file.relative_to(ws.root)))
                             found = True
                             break

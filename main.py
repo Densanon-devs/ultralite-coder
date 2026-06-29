@@ -633,11 +633,18 @@ class UltraliteCodeAssistant:
             return self._agent
 
         memory = AgentMemory(workspace=workspace)
+        # Reviewable staged edits (opt-in via --review). When on, every
+        # mutating file tool routes its final write through a confirm hook
+        # that shows the exact diff and prompts before the bytes land. Default
+        # off = byte-for-byte legacy behavior. Orthogonal to --yes (which only
+        # gates risky tools like run_bash); the two compose.
+        confirm_edit = self._confirm_edit if getattr(self, "_review_edits", False) else None
         registry = build_default_registry(
             workspace, memory=memory, ask_user_fn=self._ask_user,
             extended_tools=True,
             mcp_servers=getattr(self, "_mcp_servers", None),
             enable_web=getattr(self, "_enable_web", False),
+            confirm_edit=confirm_edit,
         )
         hint = self._build_workspace_hint(workspace)
 
@@ -695,6 +702,39 @@ class UltraliteCodeAssistant:
             return False
         approved = answer in ("y", "yes")
         print(f"  -> {'approved' if approved else 'denied'}")
+        return approved
+
+    def _confirm_edit(self, path, old_content, new_content, diff_text) -> bool:
+        """
+        Reviewable staged edit (opt-in via --review). Show the EXACT unified
+        diff for a pending file write and prompt y/N before the bytes land on
+        disk. Default DENY on Ctrl+C / EOF. Wired inside the tool's write path
+        (engine.agent_builtins._apply_file_write), so the previewed diff is
+        byte-identical to what gets written.
+
+        Orthogonal to --yes / _auto_approve_risky: that flag auto-approves
+        *risky* tools (run_bash, web), but it does NOT bypass edit review — a
+        user can run `--yes --review` to auto-run shells while still
+        hand-approving every file edit.
+        """
+        print()
+        print(f"  [review edit] {path}")
+        if diff_text:
+            for ln in diff_text.splitlines():
+                print(f"    {ln}")
+        else:
+            preview = new_content if len(new_content) <= 2000 else (
+                new_content[:2000] + f"\n... ({len(new_content) - 2000} more chars)"
+            )
+            for ln in preview.splitlines():
+                print(f"    +{ln}")
+        try:
+            answer = input("  Apply this edit? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("  -> rejected (interrupt)")
+            return False
+        approved = answer in ("y", "yes")
+        print(f"  -> {'applied' if approved else 'rejected'}")
         return approved
 
     def _confirm_destructive_command(self, call: "ToolCall", matches: list) -> bool:
@@ -825,6 +865,7 @@ class UltraliteCodeAssistant:
         auto_approve_risky: bool = False,
         mcp_servers: list[str] | None = None,
         enable_web: bool = False,
+        review_edits: bool = False,
     ) -> int:
         """
         Lightweight agent entry: load Config + BaseModel + Agent only, skip
@@ -887,6 +928,7 @@ class UltraliteCodeAssistant:
         # the agent_builtins MCP hook fires.
         uca._mcp_servers = mcp_servers or []
         uca._enable_web = enable_web
+        uca._review_edits = review_edits
 
         try:
             uca.run_agent(goal, workspace=workspace)
@@ -951,6 +993,14 @@ def main():
              "agent loop prompts y/N before each call (unless --yes). Default "
              "off preserves the zero-server invariant.",
     )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Review each file edit before it's written: show the exact diff "
+             "and prompt y/N (default deny). Orthogonal to --yes (which only "
+             "gates risky tools); the two compose — `--yes --review` auto-runs "
+             "shells but still hand-approves every file edit.",
+    )
     args = parser.parse_args()
 
     # Fast agent path: skip the full UCA init entirely. Only Config + BaseModel
@@ -964,6 +1014,7 @@ def main():
             auto_approve_risky=args.yes,
             mcp_servers=mcp_servers,
             enable_web=args.web,
+            review_edits=args.review,
         )
 
     engine = UltraliteCodeAssistant(
@@ -987,6 +1038,9 @@ def main():
         return
 
     if args.agent:
+        engine._auto_approve_risky = args.yes
+        engine._enable_web = args.web
+        engine._review_edits = args.review
         engine.run_agent(args.agent)
         engine.shutdown()
         return
