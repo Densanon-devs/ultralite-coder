@@ -887,6 +887,51 @@ def mission_pre_finish_check(workspace_root: Path | str):
     return _check
 
 
+# ── Named tool profiles (--toolset) ─────────────────────────────
+# The binary core(10) / extended(22) gate is too coarse: the 14B regresses
+# 97.6%->85.7% past ~10 unrelated tools (user-memory
+# feedback_tool_count_regression). A named toolset is core-10 plus a small,
+# THEMED add-on, so you get the right tools for a task without the kitchen-sink
+# accuracy tax. Keep each profile tight and single-themed.
+CORE_TOOL_NAMES = frozenset({
+    "read_file", "write_file", "edit_file", "list_dir", "glob", "grep",
+    "run_bash", "run_tests", "plan", "insert_at_line",
+})
+EXTENDED_TOOL_NAMES = frozenset({
+    "rename_symbol", "read_function", "checkpoint", "restore", "git_status",
+    "git_diff", "git_commit", "add_import", "find_definition", "find_usages",
+    "apply_patch", "write_agents_md",
+})
+WEB_TOOL_NAMES = frozenset({"web_search", "fetch_url"})
+_TOOLSET_UNIVERSE = CORE_TOOL_NAMES | EXTENDED_TOOL_NAMES | WEB_TOOL_NAMES
+
+TOOLSETS: dict[str, frozenset] = {
+    "coding": CORE_TOOL_NAMES,                                    # 10 — daily driver (== lean)
+    "refactor": CORE_TOOL_NAMES | frozenset({                     # 16 — code navigation/refactor
+        "rename_symbol", "read_function", "find_definition", "find_usages",
+        "add_import", "apply_patch"}),
+    "git": CORE_TOOL_NAMES | frozenset({                          # 15 — version control
+        "git_status", "git_diff", "git_commit", "checkpoint", "restore"}),
+    "web": CORE_TOOL_NAMES | WEB_TOOL_NAMES,                      # 12 — research
+    "full": _TOOLSET_UNIVERSE,                                    # 24 — kitchen sink (== --extended --web)
+}
+
+
+def _prune_to_toolset(reg: ToolRegistry, toolset: Optional[str]) -> None:
+    """Drop any builtin tool not in the named *toolset*. No-op when None.
+
+    Only prunes the known core/extended/web universe — orthogonal opt-in tools
+    (mission, ask_user, remember, MCP) are governed by their own flags and are
+    left untouched.
+    """
+    if toolset is None:
+        return
+    allowed = TOOLSETS[toolset]
+    for name in _TOOLSET_UNIVERSE:
+        if name not in allowed:
+            reg.unregister(name)
+
+
 def build_default_registry(
     workspace_root: Path | str,
     memory: Optional[AgentMemory] = None,
@@ -896,6 +941,7 @@ def build_default_registry(
     mcp_tool_pack: Optional[list[str]] = None,
     enable_web: bool = False,
     enable_mission: bool = False,
+    toolset: Optional[str] = None,
 ) -> ToolRegistry:
     """
     Build a ToolRegistry pre-populated with the 8 core Phase 14 agent tools,
@@ -918,6 +964,19 @@ def build_default_registry(
     `feedback_tool_count_regression.md`). Pass e.g.
     `["search_cards", "analyze_deck"]` to mount only those.
     """
+    # A named toolset is authoritative on the final tool set: force-register
+    # everything it needs (so the tools exist to keep), then prune to it before
+    # returning. This overrides extended_tools/enable_web — passing
+    # toolset="coding" alongside --extended still yields the lean 10.
+    if toolset is not None:
+        if toolset not in TOOLSETS:
+            raise ValueError(
+                f"Unknown toolset {toolset!r}. Choices: {sorted(TOOLSETS)}"
+            )
+        _allowed = TOOLSETS[toolset]
+        extended_tools = extended_tools or bool(_allowed & EXTENDED_TOOL_NAMES)
+        enable_web = enable_web or bool(_allowed & WEB_TOOL_NAMES)
+
     ws = Workspace(root=Path(workspace_root).resolve())
     reg = ToolRegistry()
 
@@ -1490,6 +1549,7 @@ def build_default_registry(
         if mcp_servers:
             from engine.mcp_adapter import register_mcp_tools
             register_mcp_tools(reg, mcp_servers, tool_pack=mcp_tool_pack)
+        _prune_to_toolset(reg, toolset)
         return reg
 
     # ── rename_symbol: atomic multi-file rename ──
@@ -1967,6 +2027,47 @@ def build_default_registry(
         category="file",
     ))
 
+    # ── write_agents_md: generate AGENTS.md for the workspace ──
+    # Inspects the project (language breakdown, test command, key dirs) and
+    # writes a well-formed AGENTS.md at the workspace root. Markdown only,
+    # no deps, no model inference. See engine/agents_md.py.
+
+    from engine.agents_md import generate_agents_md as _gen_agents_md
+
+    def _write_agents_md(project_dir: Optional[str] = None, **_kw) -> str:
+        """Generate AGENTS.md for project_dir (defaults to workspace root)."""
+        target = Path(project_dir) if project_dir else ws.root
+        out_path = _gen_agents_md(target)
+        return f"Wrote AGENTS.md to {out_path} ({out_path.stat().st_size} bytes)"
+
+    reg.register(ToolSchema(
+        name="write_agents_md",
+        description=(
+            "Inspect the project and write a well-formed AGENTS.md at its root. "
+            "The file tells AI coding agents how to work in this codebase: "
+            "primary language, test command, key directories, code conventions, "
+            "and what to avoid. Safe to run repeatedly — overwrites each time. "
+            "Use this when scaffolding a new project or when asked to 'generate "
+            "AGENTS.md' or 'set up agent instructions'."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "project_dir": {
+                    "type": "string",
+                    "description": (
+                        "Path to the project root. Defaults to the current "
+                        "workspace root when omitted."
+                    ),
+                },
+            },
+        },
+        function=lambda project_dir=None, **kw: _write_agents_md(
+            project_dir=project_dir, **kw
+        ),
+        category="scaffold",
+    ))
+
     # Same MCP hook the lean-mode return runs. Non-empty mcp_servers will
     # raise NotImplementedError today (see engine/mcp_adapter.py), and
     # the empty/None case is a clean no-op.
@@ -1974,6 +2075,7 @@ def build_default_registry(
         from engine.mcp_adapter import register_mcp_tools
         register_mcp_tools(reg, mcp_servers, tool_pack=mcp_tool_pack)
 
+    _prune_to_toolset(reg, toolset)
     return reg
 
 

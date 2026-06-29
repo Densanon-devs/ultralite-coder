@@ -138,6 +138,8 @@ class ArchitectAgent:
         repeat_penalty: Optional[float] = 1.15,
         confirm_risky: Optional[Callable[[ToolCall], bool]] = None,
         confirm_destructive: Optional[Callable[["ToolCall", list], bool]] = None,
+        confirm_supply_chain: Optional[Callable[["ToolCall", list], bool]] = None,
+        trust_repo: bool = False,
         on_event: Optional[Callable[[AgentEvent], None]] = None,
         planner_max_tokens: int = 800,
     ) -> None:
@@ -154,6 +156,8 @@ class ArchitectAgent:
         self.repeat_penalty = repeat_penalty
         self.confirm_risky = confirm_risky
         self.confirm_destructive = confirm_destructive
+        self.confirm_supply_chain = confirm_supply_chain
+        self.trust_repo = bool(trust_repo)
         self._emit = on_event or (lambda _e: None)
         self.planner_max_tokens = int(planner_max_tokens)
 
@@ -248,6 +252,8 @@ class ArchitectAgent:
                 repeat_penalty=self.repeat_penalty,
                 confirm_risky=self.confirm_risky,
                 confirm_destructive=self.confirm_destructive,
+                confirm_supply_chain=self.confirm_supply_chain,
+                trust_repo=self.trust_repo,
                 on_event=self._emit,
             )
             self._emit(AgentEvent("iteration", i, f"step {i}/{len(steps)}: {step[:80]}"))
@@ -304,6 +310,9 @@ class ArchitectAgent:
                     temperature=self.temperature,
                     repeat_penalty=self.repeat_penalty,
                     confirm_risky=self.confirm_risky,
+                    confirm_destructive=self.confirm_destructive,
+                    confirm_supply_chain=self.confirm_supply_chain,
+                    trust_repo=self.trust_repo,
                     on_event=self._emit,
                 )
                 self._emit(
@@ -391,6 +400,8 @@ class ArchitectAgent:
             repeat_penalty=self.repeat_penalty,
             confirm_risky=self.confirm_risky,
             confirm_destructive=self.confirm_destructive,
+            confirm_supply_chain=self.confirm_supply_chain,
+            trust_repo=self.trust_repo,
             on_event=self._emit,
         )
         return worker.run(goal)

@@ -1201,6 +1201,7 @@ def run_one_task(
     auto_flag: bool = False,
     enable_self_heal: bool = True,
     json_recovery: bool = False,
+    toolset: Optional[str] = None,
 ) -> TaskResult:
     """Run one task against the agent. Uses a fresh tmp workspace each time.
 
@@ -1240,7 +1241,7 @@ def run_one_task(
         # Isolate memory so tasks don't share state
         with tempfile.TemporaryDirectory(prefix=f"mem_{task.name}_") as mem_root:
             memory = AgentMemory(workspace=ws, root=Path(mem_root))
-            registry = build_default_registry(ws, memory=memory)
+            registry = build_default_registry(ws, memory=memory, toolset=toolset)
 
             owns_model = shared_model is None
             if shared_model is not None:
@@ -1378,6 +1379,11 @@ def run_one_task(
                     max_tokens_per_turn=max_tokens_per_turn,
                     temperature=cfg_temp if cfg_temp is not None else 0.1,
                     confirm_risky=(lambda _c: True) if auto_approve_risky else None,
+                    # Bench is a trusted, controlled environment — auto-approve
+                    # the supply-chain gate the same way as the risky gate so a
+                    # benign fixture (e.g. a package.json with a lifecycle
+                    # script) can never cause a false-refusal that fails a task.
+                    confirm_supply_chain=(lambda _c, _r: True) if auto_approve_risky else None,
                     on_event=on_event,
                 )
             else:
@@ -1394,6 +1400,7 @@ def run_one_task(
                     max_tokens_per_turn=max_tokens_per_turn,
                     temperature=cfg_temp if cfg_temp is not None else 0.1,
                     confirm_risky=(lambda _c: True) if auto_approve_risky else None,
+                    confirm_supply_chain=(lambda _c, _r: True) if auto_approve_risky else None,
                     on_event=on_event,
                     enable_self_heal=enable_self_heal,
                     json_recovery=json_recovery,
@@ -1580,6 +1587,12 @@ def main() -> int:
              "with weaker tool-call discipline that may form same-class failure streaks.",
     )
     parser.add_argument(
+        "--toolset", default=None,
+        help="Curated tool profile to bench (coding/refactor/git/web/full). "
+             "Default None = lean 10-tool core. Use to A/B that a themed subset "
+             "holds the 97.6%% baseline where the 24-tool 'full' set regresses.",
+    )
+    parser.add_argument(
         "--json-recovery", action="store_true",
         help="Engage the json_recovery layer (default OFF): on an unparseable "
              "tool call (parser returns errors, zero calls) do ONE ChatML "
@@ -1650,6 +1663,7 @@ def main() -> int:
                     # is redundant but kept for explicit-suppression callers.
                     enable_self_heal=(args.self_heal_on and not args.no_self_heal),
                     json_recovery=args.json_recovery,
+                    toolset=args.toolset,
                 )
             except KeyboardInterrupt:
                 print("\n[aborted by user]")

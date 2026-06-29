@@ -653,6 +653,7 @@ class UltraliteCodeAssistant:
             max_tokens_per_turn=1024,
             confirm_risky=self._confirm_risky_tool,
             confirm_destructive=self._confirm_destructive_command,
+            confirm_supply_chain=self._confirm_supply_chain_command,
             on_event=self._render_agent_event,
         )
         return self._agent
@@ -727,6 +728,35 @@ class UltraliteCodeAssistant:
         normalized = " ".join(answer.split())
         approved = normalized == "yes i am sure"
         print(f"  -> {'APPROVED (destructive)' if approved else 'denied'}")
+        return approved
+
+    def _confirm_supply_chain_command(self, call: "ToolCall", risks: list) -> bool:
+        """
+        High-friction confirmation for run_bash / run_tests calls flagged by
+        the supply-chain gate (fetch-and-execute, repo auto-exec drop points,
+        or a command lifted from program output — the June 2026 Miasma worm /
+        0din Axiom attack class). Mandatory prompt: --yes / _auto_approve_risky
+        does NOT bypass this. Requires typing the exact phrase `yes i trust
+        this` (a single 'y' is rejected). Default deny on Ctrl+C / EOF.
+
+        See engine/supply_chain_gate.py.
+        """
+        from engine.supply_chain_gate import format_warning
+
+        command = call.arguments.get("command", "") if isinstance(call.arguments, dict) else ""
+        print()
+        print(format_warning(command, risks))
+        print()
+        try:
+            answer = input(
+                "  To execute, type exactly  yes i trust this  (anything else = deny): "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("  -> denied (interrupt)")
+            return False
+        normalized = " ".join(answer.split())
+        approved = normalized == "yes i trust this"
+        print(f"  -> {'APPROVED (supply-chain)' if approved else 'denied'}")
         return approved
 
     def _render_agent_event(self, event: AgentEvent) -> None:

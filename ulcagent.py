@@ -261,6 +261,22 @@ def _build_agent(mgr: ModelManager, workspace: Path):
     extended = "--extended" in sys.argv
     enable_web = "--web" in sys.argv
     auto_yes = "--yes" in sys.argv
+    # `--trust-repo`: "I vouch for this repo's files." Suppresses the
+    # supply-chain gate's repo-content scan (.github/setup.js, .claude hooks,
+    # package.json lifecycle scripts) for this workspace. The command-shape
+    # checks (curl|sh, command-lifted-from-output) STILL fire. See
+    # engine/supply_chain_gate.py.
+    trust_repo = "--trust-repo" in sys.argv
+    # `--toolset NAME` (or `--toolset=NAME`): curated themed tool set
+    # (coding/refactor/git/web/full). Authoritative over --extended/--web —
+    # keeps the model under the ~10-tool accuracy cliff per task. See
+    # engine.agent_builtins.TOOLSETS.
+    toolset = None
+    for _i, _a in enumerate(sys.argv):
+        if _a == "--toolset" and _i + 1 < len(sys.argv):
+            toolset = sys.argv[_i + 1]
+        elif _a.startswith("--toolset="):
+            toolset = _a.split("=", 1)[1]
     # Mission tracking: explicit via --mission, OR auto-engage if a mission
     # file already exists in the workspace (so resuming "just works" even
     # without the flag). When engaged, the `mission` tool is registered AND
@@ -282,6 +298,7 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         mcp_servers=mcp_servers,
         enable_web=enable_web,
         enable_mission=enable_mission,
+        toolset=toolset,
     )
 
     # Add system tools for the general profile
@@ -307,6 +324,43 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         except (EOFError, KeyboardInterrupt):
             answer = ""
         return answer in ("y", "yes")
+
+    def _confirm_destructive(call, matches):
+        # Mandatory high-friction prompt for destructive shell commands
+        # (rm -rf, DROP TABLE, git reset --hard, ...). NOT bypassed by --yes.
+        # Requires the exact phrase `yes i am sure`. See
+        # engine/destructive_command_gate.py.
+        _spinner.stop()
+        from engine.destructive_command_gate import format_warning
+        command = call.arguments.get("command", "") if isinstance(call.arguments, dict) else ""
+        print()
+        print(_red(format_warning(command, matches)))
+        try:
+            answer = input(
+                f"  {_red('To execute, type exactly  yes i am sure :')} "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        return " ".join(answer.split()) == "yes i am sure"
+
+    def _confirm_supply_chain(call, risks):
+        # Mandatory high-friction prompt for the Miasma worm / 0din Axiom
+        # attack class (fetch-and-execute, repo auto-exec drop points, or a
+        # command lifted from program output). NOT bypassed by --yes.
+        # Requires the exact phrase `yes i trust this`. See
+        # engine/supply_chain_gate.py.
+        _spinner.stop()
+        from engine.supply_chain_gate import format_warning
+        command = call.arguments.get("command", "") if isinstance(call.arguments, dict) else ""
+        print()
+        print(_red(format_warning(command, risks)))
+        try:
+            answer = input(
+                f"  {_red('To execute, type exactly  yes i trust this :')} "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        return " ".join(answer.split()) == "yes i trust this"
 
     # Pair tool_call with the next tool_result so we audit a single combined
     # entry. Without pairing, each call would appear twice (once on dispatch,
@@ -416,6 +470,9 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         max_tokens_per_turn=int(cfg_max) if cfg_max else 1024,
         temperature=cfg_temp if cfg_temp is not None else 0.1,
         confirm_risky=_confirm_risky,
+        confirm_destructive=_confirm_destructive,
+        confirm_supply_chain=_confirm_supply_chain,
+        trust_repo=trust_repo,
         pre_finish_check=pre_finish_check,
         augment_for_goal=augment_for_goal,
         # Re-enabled 2026-05-10 after the security-domain soak found 4/5
@@ -1587,6 +1644,10 @@ _HELP_TEXT = """
     --mission       Durable multi-step mission tracking (auto-on if
                     .ulcagent_mission.json exists; survives sessions/compaction)
     --yes           Auto-approve all risky tool calls (unattended runs only)
+    --trust-repo    Vouch for this repo's files: skip the supply-chain gate's
+                    repo-content scan (.github/setup.js, .claude hooks,
+                    package.json install scripts). curl|sh and commands lifted
+                    from program output are STILL blocked.
     --new-engagement NAME
                     Scaffold a new engagement workspace (scope/, evidence/,
                     findings/, tools/, audit/, report/) and exit.
