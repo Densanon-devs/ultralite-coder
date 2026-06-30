@@ -1,20 +1,22 @@
 """
-Tests for the auto-flag-on-fail hook in ulcagent and benchmark_agentic.
+Tests for the auto-flag / auto-promote surface in benchmark_agentic.
 
 Exercises:
-- _maybe_auto_flag is importable from ulcagent and is callable
-- _maybe_auto_flag is a no-op on None / clean results / missing modules
-- _maybe_auto_flag writes YAML files + prints a summary on flagged results
 - benchmark_agentic CLI accepts --auto-flag flag
-- benchmark_agentic.run_one_task accepts auto_flag kwarg
+- benchmark_agentic.run_one_task accepts an auto_flag kwarg (default False)
+- benchmark_agentic CLI accepts --auto-promote flag
+
+NOTE (2026-06-30): the original file also tested a `_maybe_auto_flag` hook
+imported from `ulcagent`, but that function was never implemented in
+`ulcagent.py` (it exists nowhere in the repo), so those 5 tests failed at
+collection on every branch since the harvest-pipeline experiment added them.
+The surviving auto-flag mechanism lives entirely in `benchmark_agentic.py`,
+which is what this file now tests. The dead `_maybe_auto_flag` import + tests
+were removed so the file collects and the real coverage runs.
 """
 from __future__ import annotations
-import io
 import sys
-import tempfile
 from pathlib import Path
-from types import SimpleNamespace
-from contextlib import redirect_stdout
 
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
@@ -22,81 +24,6 @@ sys.path.insert(0, str(ROOT))
 _CORE_ROOT = ROOT.parent / "densanon-core"
 if _CORE_ROOT.exists() and str(_CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(_CORE_ROOT))
-
-from ulcagent import _maybe_auto_flag, _SELF
-
-
-def _stub_call(name, **args): return SimpleNamespace(name=name, arguments=args)
-def _stub_ok(content=""):     return SimpleNamespace(success=True, content=content, error="")
-def _stub_err(content="", error=""): return SimpleNamespace(success=False, content=content, error=error)
-
-
-def test_maybe_auto_flag_is_callable():
-    assert callable(_maybe_auto_flag)
-
-
-def test_maybe_auto_flag_handles_none_silently():
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        _maybe_auto_flag(None, "any goal")
-    assert buf.getvalue() == ""
-
-
-def test_maybe_auto_flag_silent_on_clean_result():
-    """Clean run (no failures) should produce no output and no YAML files."""
-    res = SimpleNamespace(
-        final_answer="Done.",
-        tool_calls=[_stub_call("write_file", path="x.py", content=["pass"])],
-        tool_results=[_stub_ok(content="Wrote 4 chars to x.py\nsyntax OK (x.py)")],
-        stop_reason="answered",
-    )
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        _maybe_auto_flag(res, "Add a placeholder file")
-    assert "auto-flagged" not in buf.getvalue()
-
-
-def test_maybe_auto_flag_writes_yaml_on_flagged_result(tmp_path=None, monkeypatch=None):
-    """When a known pattern fires, the hook should print one summary line
-    AND a YAML file should land under data/augmentor_examples/_auto_generated/.
-    Uses a temp _SELF override to avoid polluting the real repo."""
-    import ulcagent as _ula
-    real_self = _ula._SELF
-    tmp = Path(tempfile.mkdtemp())
-    _ula._SELF = tmp
-    try:
-        res = SimpleNamespace(
-            final_answer="",
-            tool_calls=[_stub_call("write_file", path="storage.py", content=["..."])],
-            tool_results=[_stub_err(error="bare JSON tool call failed to parse: Expecting ',' delimiter")],
-            stop_reason="answered",
-        )
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            _maybe_auto_flag(res, "Build a todo CLI")
-        out = buf.getvalue()
-        assert "auto-flagged" in out
-        assert "json_quote_leak" in out
-        # YAML file landed in the review dir (NOT under augmentor_examples/)
-        yaml_files = list((tmp / "data" / "auto_generated_review").rglob("*.yaml"))
-        assert len(yaml_files) >= 1
-        assert not (tmp / "data" / "augmentor_examples").exists() \
-            or not list((tmp / "data" / "augmentor_examples").rglob("*.yaml")), \
-            "auto-flag must NOT write into the retrieval scan path"
-    finally:
-        _ula._SELF = real_self
-
-
-def test_maybe_auto_flag_swallows_internal_exceptions():
-    """If the failure_flagger / yaml_builder modules raise, the hook must
-    not propagate — it's a side-channel feature, not a critical path."""
-    bad = SimpleNamespace(
-        # Missing tool_calls / tool_results / final_answer attributes
-    )
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        _maybe_auto_flag(bad, "any")
-    # Should not raise; output may be empty
 
 
 def test_bench_cli_accepts_auto_flag_flag():
