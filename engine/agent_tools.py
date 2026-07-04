@@ -198,6 +198,22 @@ def _decode_with_repair(body: str) -> Optional[dict]:
             obj = _try_extra_brace_recovery(repaired)
             if obj is not None:
                 return obj
+    # Tier 6 (runs BEFORE tier 4): lenient content-array reconstruction for a
+    # COMPLETE write_file array whose lines contain unescaped inner `"`. The
+    # array-of-lines form (`"content": ["line1", "line2", ...]`) sidesteps
+    # NEWLINE escaping, but a line like `print(f"{x}")` still breaks strict
+    # JSON — the string element terminates early and the whole call is dropped.
+    # Since we know the shape, reconstruct the elements textually via the
+    # distinctive `" , "` delimiter, preserving inner quotes verbatim. Ordered
+    # before the LOSSY tier-4 truncation recovery because the inner-quote error
+    # ("Expecting ',' delimiter") also matches tier-4's trigger — and tier-4
+    # would close the array early, silently dropping lines. Tier-6 self-gates to
+    # genuinely complete arrays (it needs a closing `]`), so a real max_tokens
+    # truncation (no closing `]`) returns None here and falls through to tier-4.
+    obj = _try_lenient_content_array(body)
+    if obj is not None:
+        return obj
+
     # Tier 4: Truncated content-array recovery. When max_tokens cuts the
     # model's output mid-string inside a content array like
     #   {"name":"write_file","arguments":{"path":"x.py","content":["line1","line2","li
@@ -236,6 +252,64 @@ def _decode_with_repair(body: str) -> Optional[dict]:
             if isinstance(obj, dict):
                 return obj
     return None
+
+
+# Inter-element boundary in an array-of-lines: a closing quote, a comma, then
+# (optional whitespace/newline) the opening quote of the next element. Far more
+# distinctive than a bare quote and rarely occurs inside one source line.
+_ARRAY_ELEM_SEP_RE = re.compile(r'"\s*,\s*"')
+_NAME_RE = re.compile(r'"name"\s*:\s*"([^"\\]+)"')
+_PATH_RE = re.compile(r'"path"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _unescape_line(s: str) -> str:
+    """Best-effort JSON-string unescape for a single reconstructed line.
+
+    Handles the escapes the model DOES emit correctly (`\\"`, `\\\\`, `\\t`)
+    without choking on the unescaped inner quotes that broke strict decode.
+    Order matters: resolve `\\\\` last so an escaped backslash isn't consumed.
+    """
+    out = s.replace('\\"', '"').replace("\\t", "\t").replace("\\/", "/")
+    return out.replace("\\\\", "\\")
+
+
+def _try_lenient_content_array(body: str) -> Optional[dict]:
+    """Reconstruct a write_file call whose `content` array has unescaped inner
+    quotes. Returns the rebuilt dict, or None if the body doesn't match the
+    expected complete-write_file-content-array shape.
+    """
+    name_m = _NAME_RE.search(body)
+    if not name_m or name_m.group(1) != "write_file":
+        return None
+    content_idx = body.find('"content"')
+    if content_idx == -1:
+        return None
+    bracket_idx = body.find("[", content_idx)
+    if bracket_idx == -1:
+        return None
+    array_end = body.rfind("]")
+    if array_end <= bracket_idx:
+        return None
+    path_m = _PATH_RE.search(body[:content_idx]) or _PATH_RE.search(body)
+    if not path_m:
+        return None
+    inner = body[bracket_idx + 1:array_end].strip()
+    if not inner:
+        return None
+    if inner.startswith('"'):
+        inner = inner[1:]
+    if inner.endswith('"'):
+        inner = inner[:-1]
+    elif inner.endswith('",'):
+        inner = inner[:-2]
+    lines = [_unescape_line(e) for e in _ARRAY_ELEM_SEP_RE.split(inner)]
+    if not lines:
+        return None
+    try:
+        path_val = json.loads('"' + path_m.group(1) + '"')
+    except json.JSONDecodeError:
+        path_val = path_m.group(1)
+    return {"name": "write_file", "arguments": {"path": path_val, "content": lines}}
 
 
 def _try_truncated_array_recovery(body: str) -> Optional[dict]:
@@ -370,6 +444,19 @@ def _scan_bare_json_calls(text: str) -> tuple[list[tuple[dict, str]], list[str]]
             if py_obj is not None and _is_tool_call_obj(py_obj):
                 found.append((py_obj, text[idx:py_end]))
                 i = py_end
+                continue
+            # Tier 6 (bare path): a write_file content-array with unescaped
+            # inner quotes fails raw_decode AND the escape/literal-eval tiers
+            # above. Reconstruct the array-of-lines textually (inner quotes
+            # preserved). Self-gates to a complete write_file array.
+            len_obj = _try_lenient_content_array(text[idx:])
+            if len_obj is not None and _is_tool_call_obj(len_obj):
+                reg = text[idx:]
+                j = reg.rfind("]")
+                while j < len(reg) and reg[j] in "]}\t \n,":
+                    j += 1
+                found.append((len_obj, reg[:j]))
+                i = idx + max(j, 1)
                 continue
             # Probe: does this `{...}` region look like a tool call attempt?
             probe = text[idx : idx + 800]
