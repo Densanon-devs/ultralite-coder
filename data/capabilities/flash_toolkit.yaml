@@ -1,0 +1,185 @@
+                                        # ulcagent capability catalog — flash-toolkit
+#
+# WHY A CATALOG INSTEAD OF TOOLS: registering these as individual agent tools
+# would blow past the ~10-tool accuracy cliff (22 tools already drops the 14B to
+# ~86%). Instead the broker exposes exactly two tools — list_capabilities and
+# run_capability — and the model discovers entries from this file on demand. The
+# schemas never sit in the prompt.
+#
+# HOW EXECUTION WORKS: none of the 46 flash-toolkit scripts have a
+# non-interactive mode; they are straight-line or menu-loop scripts driven by
+# Read-Host. PowerShell's Read-Host reads piped stdin, so each entry declares the
+# exact answer sequence and the broker pipes it. That means ZERO edits to the
+# portable USB scripts — their interactive UX is untouched.
+#
+# SAFETY RULES baked into this file:
+#   * every `prompts` sequence is verified against the script's actual Read-Host
+#     order — a desynced sequence would answer the WRONG question
+#   * any y/n prompt that would delete, modify or launch something is pinned to
+#     "n" (see find_duplicates: the script offers to delete duplicates)
+#   * `safety: write` entries are routed through the agent's risky-tool y/N
+#     confirmation before they run
+#   * menu-loop scripts always end with their Exit choice, so a desync
+#     terminates instead of spinning in the loop
+
+toolkit: flash-toolkit
+root: D:/LLCWork/flash-toolkit
+
+capabilities:
+  # ── read-only diagnostics ──────────────────────────────────────
+  - name: system_info
+    script: sys-info/SysInfo.ps1
+    summary: Full snapshot of this computer — OS, CPU, RAM, disks, network, uptime, top processes.
+    keywords: [system, specs, hardware, cpu, ram, memory, os, version, uptime, machine, computer]
+    safety: read
+    timeout_sec: 240
+    prompts:
+      - literal: "n"        # Save report to file?
+      - literal: ""         # Press Enter to exit
+
+  - name: folder_sizes
+    script: disk-analyzer/DiskAnalyzer.ps1
+    summary: Which folders are eating disk space under a given path, ranked by size.
+    # NOT named disk_usage: ulcagent's general profile already registers a
+    # `disk_usage` system tool (whole-drive free space). Two tools with one name
+    # made the model call both and waste an iteration.
+    keywords: [disk, space, usage, size, biggest, largest, folders, full, storage, drive]
+    safety: read
+    timeout_sec: 900
+    args:
+      - name: path
+        required: true
+        description: "Folder or drive to analyze, e.g. 'D:/' or 'C:/Users/Jordan'"
+    prompts:
+      - arg: path
+      - literal: "n"        # Save report to file?
+      - literal: ""         # Press Enter to exit
+
+  - name: installed_software
+    script: software-audit/SoftwareAudit.ps1
+    summary: Every program installed on this machine, with versions and publishers.
+    keywords: [software, installed, programs, apps, applications, audit, versions]
+    safety: read
+    timeout_sec: 300
+    prompts:
+      - literal: "n"        # Save report?
+      - literal: ""         # Press Enter to exit
+
+  - name: usb_history
+    script: usb-history/USBHistory.ps1
+    summary: Every USB device ever connected to this machine, from the registry.
+    keywords: [usb, history, devices, drives, connected, forensics, thumb drive]
+    safety: read
+    timeout_sec: 240
+    prompts:
+      - literal: "n"        # Save report?
+      - literal: ""         # Press Enter to exit
+
+  - name: find_duplicates
+    script: duplicate-finder/DuplicateFinder.ps1
+    summary: Find duplicate files under a folder by hash. Reports only — never deletes.
+    keywords: [duplicate, duplicates, dupes, copies, same file, redundant, wasted space]
+    # NOTE: the script offers "Delete all duplicates? (y/n)" at line 166. That
+    # prompt is pinned to "n" below and must stay that way — this entry is
+    # classified read-only precisely because deletion is declined.
+    safety: read
+    timeout_sec: 1200
+    args:
+      - name: path
+        required: true
+        description: "Folder to scan for duplicates"
+    prompts:
+      - arg: path
+      - literal: "n"        # Delete all duplicates?  <-- MUST remain "n"
+      - literal: ""         # Press Enter to exit
+
+  - name: network_scan
+    script: network-scanner/NetworkScanner.ps1
+    summary: Scan the local subnet for live hosts, with hostnames and MAC addresses.
+    keywords: [network, scan, subnet, lan, hosts, devices, ip, arp, who is on my network]
+    safety: read
+    # Reads nothing on THIS machine but probes every other device on the
+    # subnet, so it asks first even though it changes nothing.
+    confirm: true
+    timeout_sec: 900
+    prompts:
+      - literal: ""         # accept the auto-detected subnet
+      - literal: ""         # Press Enter to exit
+
+  - name: battery_report
+    script: battery-report/BatteryReport.ps1
+    summary: Battery health, design vs full-charge capacity, and wear level.
+    keywords: [battery, power, charge, health, wear, laptop]
+    safety: read
+    timeout_sec: 180
+    prompts:
+      - literal: "n"        # Generate detailed Windows report? (would open a browser)
+      - literal: ""         # Press Enter to exit
+
+  - name: file_hash
+    script: hash-checker/HashChecker.ps1
+    summary: Compute MD5, SHA1 and SHA256 for a single file.
+    keywords: [hash, checksum, md5, sha256, sha1, verify, integrity, fingerprint]
+    safety: read
+    timeout_sec: 300
+    args:
+      - name: path
+        required: true
+        description: "File to hash"
+    prompts:
+      - literal: "1"        # menu: Hash a file
+      - arg: path
+      - literal: "n"        # Copy SHA256 to clipboard?
+      - literal: "0"        # menu: Exit
+
+  - name: disk_health
+    script: disk-health/DiskHealth.ps1
+    summary: Physical disk info, SMART reliability counters, and volume health.
+    keywords: [disk, health, smart, failing, ssd, hdd, reliability, bad sectors]
+    safety: read
+    timeout_sec: 300
+    args:
+      - name: section
+        required: false
+        default: "1"
+        description: "1=physical disk info, 2=SMART counters, 3=volume health"
+    prompts:
+      - arg: section
+      - literal: "0"        # menu: Exit
+
+  - name: startup_items
+    script: startup-manager/StartupManager.ps1
+    summary: Everything that auto-starts on this machine — registry, startup folder, tasks, services.
+    keywords: [startup, boot, autostart, autorun, login, slow boot, launches]
+    # Menu item "1" only LISTS. The disable/enable items ("D"/"E") are never sent.
+    safety: read
+    timeout_sec: 300
+    prompts:
+      - literal: "1"        # menu: Show all startup entries
+      - literal: "0"        # menu: Exit
+
+  # ── modifies the machine — gated by the risky-tool y/N confirm ──
+  - name: temp_cleanup
+    script: temp-cleaner/TempCleaner.ps1
+    summary: Delete temporary files to reclaim disk space. MODIFIES the machine.
+    keywords: [temp, cleanup, clean, clear, cache, reclaim, free space, junk]
+    safety: write
+    timeout_sec: 900
+    args:
+      - name: mode
+        required: false
+        default: "2"
+        description: "1=all listed locations, 2=temp folders only (safest), 3=browser caches only"
+    prompts:
+      - arg: mode
+      - literal: "n"        # Also empty Recycle Bin?  <-- kept "n" so nothing unrecoverable
+      - literal: ""         # Press Enter to exit
+
+# Deliberately NOT catalogued yet — do not add without verifying the exact
+# Read-Host order first, because a wrong answer here changes the machine:
+#   process-manager  — the menu found at line 157 is the PRIORITY submenu, not
+#                      the main menu; it has kill-process paths.
+#   hosts-editor     — main menu is "Choose (0-7)" but the item labels were not
+#                      confirmed; a wrong number edits the hosts file.
+#   file-shredder,
+#   user-manager     — irreversible / account-level. Out of scope by policy.

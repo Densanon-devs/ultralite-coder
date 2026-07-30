@@ -14,6 +14,7 @@ from engine.agent_builtins import (
     CORE_TOOL_NAMES,
     EXTENDED_TOOL_NAMES,
     WEB_TOOL_NAMES,
+    _TOOLSET_UNIVERSE,
 )
 
 
@@ -41,9 +42,47 @@ def test_toolset_matches_profile_exactly(toolset):
     assert _names(toolset=toolset) == set(TOOLSETS[toolset])
 
 
-def test_every_profile_contains_core():
-    for ts, allowed in TOOLSETS.items():
-        assert CORE_TOOL_NAMES <= allowed, f"{ts} dropped a core tool"
+# Profiles come in two classes now:
+#   * CODING profiles are core-10 + a themed add-on (refactor/git/web/full).
+#   * SCOPED profiles are deliberately REDUCED — `assistant` answers questions
+#     about the machine and must not be able to write to it.
+#   * HYBRID profiles are scoped too, but DO write — outside the workspace even —
+#     so they are governed by engine.write_policy's allowlist instead of by
+#     omitting the tools. See test_write_policy.py for that half.
+CODING_PROFILES = ("coding", "refactor", "git", "web", "full")
+SCOPED_PROFILES = ("assistant",)
+HYBRID_PROFILES = ("hybrid",)
+
+
+def test_profile_classes_cover_every_toolset():
+    """If someone adds a profile, they must classify it here."""
+    classified = set(CODING_PROFILES) | set(SCOPED_PROFILES) | set(HYBRID_PROFILES)
+    assert classified == set(TOOLSETS), (
+        "unclassified toolset — add it to CODING_PROFILES, SCOPED_PROFILES "
+        "or HYBRID_PROFILES"
+    )
+
+
+def test_hybrid_profiles_are_small_and_carry_the_asked_for_powers():
+    for ts in HYBRID_PROFILES:
+        allowed = TOOLSETS[ts]
+        assert len(allowed) <= 10, f"{ts} is {len(allowed)} tools — over the cliff"
+        for needed in ("locate", "move_path", "write_file", "edit_file", "recall"):
+            assert needed in allowed, f"{ts} is missing {needed}"
+
+
+def test_every_coding_profile_contains_core():
+    for ts in CODING_PROFILES:
+        assert CORE_TOOL_NAMES <= TOOLSETS[ts], f"{ts} dropped a core tool"
+
+
+def test_scoped_profiles_have_no_write_tools():
+    """The point of a reduced profile: it cannot modify files."""
+    for ts in SCOPED_PROFILES:
+        allowed = TOOLSETS[ts]
+        for w in ("write_file", "edit_file", "insert_at_line", "apply_patch",
+                  "rename_symbol", "add_import", "restore"):
+            assert w not in allowed, f"{ts} must not expose {w}"
 
 
 def test_profiles_stay_under_count_cliff():
@@ -53,9 +92,10 @@ def test_profiles_stay_under_count_cliff():
 
 
 def test_full_is_whole_universe():
-    assert _names(toolset="full") == (
-        set(CORE_TOOL_NAMES) | set(EXTENDED_TOOL_NAMES) | set(WEB_TOOL_NAMES)
-    )
+    # The universe grew an assistant tier (locate + the capability broker), so
+    # assert against it directly rather than re-deriving from the coding sets.
+    assert _names(toolset="full") == set(_TOOLSET_UNIVERSE)
+    assert set(CORE_TOOL_NAMES) | set(EXTENDED_TOOL_NAMES) | set(WEB_TOOL_NAMES)         <= set(_TOOLSET_UNIVERSE)
 
 
 def test_toolset_overrides_extended_and_web():

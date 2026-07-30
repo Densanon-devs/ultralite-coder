@@ -246,6 +246,58 @@ def _coerce_text(val) -> str:
     return str(val)
 
 
+def _guard_write(policy, ws: Workspace, path: str, op: str) -> Path:
+    """Resolve *path* and refuse it if the write policy says no.
+
+    A no-op when `policy` is None, which keeps coding mode byte-for-byte on the
+    legacy path. When a policy IS present (hybrid mode), a refusal raises
+    PermissionError carrying the verdict's reason, so the model sees exactly
+    which roots are allowed and can correct itself instead of retrying blindly.
+    """
+    target = ws.resolve(path)
+    if policy is None:
+        return target
+    verdict = policy.check(target, op)
+    if not verdict.allowed:
+        raise PermissionError(f"{op} refused: {verdict.reason}")
+    return target
+
+
+def _move_path(ws: Workspace, source: str, destination: str,
+               overwrite: bool = False, policy=None) -> str:
+    """Move or rename a file or directory, inside the write policy."""
+    import shutil as _shutil
+
+    from . import write_policy as _wp
+
+    src = _guard_write(policy, ws, source, "move")
+    dst = _guard_write(policy, ws, destination, "move")
+
+    if not src.exists():
+        raise FileNotFoundError(f"Source does not exist: {source}")
+
+    # Moving INTO an existing directory keeps the original filename, which is
+    # what a person means by "move report.pdf to Documents".
+    if dst.is_dir() and src.name != dst.name:
+        dst = dst / src.name
+
+    if dst.exists():
+        if not overwrite:
+            raise FileExistsError(
+                f"{dst} already exists. Pass overwrite=true to replace it.")
+        if dst.is_dir():
+            raise IsADirectoryError(f"Refusing to overwrite a directory: {dst}")
+
+    backup = _wp._backup(dst) if dst.is_file() else None
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _shutil.move(str(src), str(dst))
+    _wp.record("move", src, dest=dst, backup=backup)
+    note = f"Moved {src} -> {dst}"
+    if backup:
+        note += f"\n(replaced file backed up to {backup})"
+    return note + "\n(reverse with: ulcagent --revert-last)"
+
+
 def _write_file(ws: Workspace, path: str, content=None, new_string=None,
                 confirm_edit: Optional[Callable] = None, **_ignored) -> str:
     """Write the whole file.
@@ -660,6 +712,46 @@ def _list_dir(ws: Workspace, path: str = ".", depth: int = 1, show_hidden: bool 
     return "\n".join(entries)
 
 
+def _locate(query: str, kind: str = "any", limit: int = 20) -> str:
+    """Machine-wide name lookup via the prebuilt index.
+
+    Deliberately NOT workspace-anchored — that anchoring is exactly why
+    "where is the Densanon LLC folder?" used to fail: every other discovery
+    tool searched the cwd, and the folder was on another drive.
+    """
+    from . import file_index
+
+    st = file_index.status()
+    if not st["exists"] or not st["entries"]:
+        return ("No file index yet. Build it with `ulcagent --reindex` "
+                "(about 15 seconds), then retry locate.")
+
+    hits = file_index.locate(query, kind=kind, limit=limit)
+    if not hits:
+        note = f"No match for {query!r} in the file index."
+        if st["stale"]:
+            note += " The index is over a day old — `ulcagent --reindex` may help."
+        return note
+
+    lines = [f"{len(hits)} match(es) for {query!r}:"]
+    for h in hits:
+        if h.is_dir:
+            lines.append(f"  [dir]  {h.path}")
+        else:
+            lines.append(f"  [file] {h.path}  ({_human_size(h.size)})")
+    if st["stale"]:
+        lines.append("  (index is over a day old; run `ulcagent --reindex` to refresh)")
+    return "\n".join(lines)
+
+
+def _human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}GB"
+
+
 def _glob(ws: Workspace, pattern: str, path: str = ".") -> str:
     root = ws.resolve(path)
     if not root.exists():
@@ -986,7 +1078,17 @@ EXTENDED_TOOL_NAMES = frozenset({
     "apply_patch", "write_agents_md",
 })
 WEB_TOOL_NAMES = frozenset({"web_search", "fetch_url"})
-_TOOLSET_UNIVERSE = CORE_TOOL_NAMES | EXTENDED_TOOL_NAMES | WEB_TOOL_NAMES
+# Machine-wide discovery. Kept OUT of CORE_TOOL_NAMES on purpose: the lean
+# 10-tool registry benchmarks at 100% and tool count is a known regression lever
+# on the 14B, so `locate` ships as opt-in (assistant/full) until an A/B says the
+# core set can carry an 11th. See docs note in ASSISTANT_MODE.md.
+ASSISTANT_TOOL_NAMES = frozenset({"locate", "list_capabilities", "run_capability"})
+# Hybrid-only additions: machine-wide mutation (policy-gated) and personal-memory
+# recall. Separate from ASSISTANT_TOOL_NAMES because `assistant` stays read-only.
+HYBRID_TOOL_NAMES = frozenset({"move_path", "recall"})
+
+_TOOLSET_UNIVERSE = (CORE_TOOL_NAMES | EXTENDED_TOOL_NAMES | WEB_TOOL_NAMES
+                     | ASSISTANT_TOOL_NAMES | HYBRID_TOOL_NAMES)
 
 TOOLSETS: dict[str, frozenset] = {
     "coding": CORE_TOOL_NAMES,                                    # 10 — daily driver (== lean)
@@ -996,6 +1098,20 @@ TOOLSETS: dict[str, frozenset] = {
     "git": CORE_TOOL_NAMES | frozenset({                          # 15 — version control
         "git_status", "git_diff", "git_commit", "checkpoint", "restore"}),
     "web": CORE_TOOL_NAMES | WEB_TOOL_NAMES,                      # 12 — research
+    # "Where is X on my computer / what's on this box" mode. Deliberately the
+    # SMALLEST set that can answer those questions: machine-wide discovery plus
+    # read + shell, and NO write/edit tools, so an assistant session can't
+    # rewrite files outside a project it was never pointed at.
+    "assistant": ASSISTANT_TOOL_NAMES | frozenset({               # 8 — computer assistant
+        "read_file", "list_dir", "glob", "grep", "run_bash"}),
+    # The daily-driver "do what I need on this computer" profile. Exactly 10 —
+    # the proven registry size — which is why run_bash and glob are absent:
+    # `locate` covers glob, and the capability broker covers the safe system
+    # actions run_bash was being used for. Use --toolset full if you need a shell.
+    "hybrid": frozenset({
+        "locate", "read_file", "list_dir", "grep",
+        "write_file", "edit_file", "move_path",
+        "list_capabilities", "run_capability", "recall"}),
     "full": _TOOLSET_UNIVERSE,                                    # 24 — kitchen sink (== --extended --web)
 }
 
@@ -1024,6 +1140,11 @@ def build_default_registry(
     mcp_tool_pack: Optional[list[str]] = None,
     enable_web: bool = False,
     enable_mission: bool = False,
+    enable_locate: bool = False,
+    enable_capabilities: bool = False,
+    confirm_capability: Optional[Callable] = None,
+    write_policy=None,
+    enable_recall: bool = False,
     toolset: Optional[str] = None,
     confirm_edit: Optional[Callable] = None,
 ) -> ToolRegistry:
@@ -1092,6 +1213,27 @@ def build_default_registry(
         category="file",
     ))
 
+    def _journaled(target: Path, op_if_new: str, op_if_exists: str):
+        """Back up an existing file and record the mutation. No-op without a policy."""
+        if write_policy is None:
+            return
+        from . import write_policy as _wp
+        existed = target.is_file()
+        backup = _wp._backup(target) if existed else None
+        _wp.record(op_if_exists if existed else op_if_new, target, backup=backup)
+
+    def _guarded_write(path, content=None, new_string=None, **kw):
+        target = _guard_write(write_policy, ws, path, "write")
+        _journaled(target, "create", "overwrite")
+        return _write_file(ws, path, content=content, new_string=new_string,
+                           confirm_edit=confirm_edit, **kw)
+
+    def _guarded_edit(path, old_string, new_string, replace_all=False):
+        target = _guard_write(write_policy, ws, path, "edit")
+        _journaled(target, "create", "edit")
+        return _edit_file(ws, path, old_string, new_string, replace_all,
+                          confirm_edit=confirm_edit)
+
     reg.register(ToolSchema(
         name="write_file",
         description=(
@@ -1118,10 +1260,7 @@ def build_default_registry(
             },
             "required": ["path", "content"],
         },
-        function=lambda path, content=None, new_string=None, **kw: _write_file(
-            ws, path, content=content, new_string=new_string,
-            confirm_edit=confirm_edit, **kw
-        ),
+        function=_guarded_write,
         category="file",
     ))
 
@@ -1145,9 +1284,7 @@ def build_default_registry(
             },
             "required": ["path", "old_string", "new_string"],
         },
-        function=lambda path, old_string, new_string, replace_all=False: _edit_file(
-            ws, path, old_string, new_string, replace_all, confirm_edit=confirm_edit
-        ),
+        function=_guarded_edit,
         category="file",
     ))
 
@@ -1186,6 +1323,141 @@ def build_default_registry(
         function=lambda pattern, path=".": _glob(ws, pattern, path),
         category="fs",
     ))
+
+    if enable_locate or toolset in ("assistant", "hybrid", "full"):
+        reg.register(ToolSchema(
+            name="locate",
+            description=(
+                "Find a file or folder ANYWHERE on this computer by name, using "
+                "a prebuilt index. Use this — not glob — whenever the user asks "
+                "where something is, or names a file/folder that isn't under the "
+                "current project. glob only searches the current workspace; "
+                "locate searches the whole machine and answers instantly. "
+                "Example: locate(query='densanon llc', kind='dir')."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string",
+                              "description": "Words from the name, e.g. 'densanon llc'"},
+                    "kind": {"type": "string", "enum": ["any", "dir", "file"],
+                             "description": "Restrict to folders or files",
+                             "default": "any"},
+                    "limit": {"type": "integer", "description": "Max results",
+                              "default": 20},
+                },
+                "required": ["query"],
+            },
+            function=lambda query, kind="any", limit=20: _locate(query, kind, limit),
+            category="fs",
+        ))
+
+    if toolset in ("hybrid", "full") or write_policy is not None:
+        reg.register(ToolSchema(
+            name="move_path",
+            description=(
+                "Move or rename a file or folder. Give the full source and "
+                "destination paths. Moving into an existing folder keeps the "
+                "original filename. Refuses to replace an existing file unless "
+                "overwrite=true, and refuses any path outside the allowed write "
+                "roots. Reversible with `ulcagent --revert-last`."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Path to move"},
+                    "destination": {"type": "string",
+                                    "description": "New path, or a folder to move into"},
+                    "overwrite": {"type": "boolean",
+                                  "description": "Replace the destination if it exists",
+                                  "default": False},
+                },
+                "required": ["source", "destination"],
+            },
+            function=lambda source, destination, overwrite=False: _move_path(
+                ws, source, destination, overwrite, policy=write_policy),
+            category="file",
+            risky=True,
+        ))
+
+    if toolset in ("hybrid", "full") or enable_recall:
+        from . import densassistant_bridge as _da
+
+        reg.register(ToolSchema(
+            name="recall",
+            description=(
+                "Search the user's OWN captured history in DensAssistant — screen "
+                "text, meeting transcripts and notes from this machine. Use it for "
+                "questions about what the user saw, said, read or worked on ('what "
+                "was I doing with X', 'what did that meeting say about Y'). This is "
+                "personal memory, NOT the filesystem and NOT the web."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to look for"},
+                    "limit": {"type": "integer", "description": "Max hits", "default": 8},
+                },
+                "required": ["query"],
+            },
+            function=lambda query, limit=8: _da.format_recall(query, limit),
+            category="memory",
+        ))
+
+    if enable_capabilities or toolset in ("assistant", "hybrid", "full"):
+        from . import capability_broker as _broker
+
+        reg.register(ToolSchema(
+            name="list_capabilities",
+            description=(
+                "Search this computer's installed toolkit utilities (system info, "
+                "disk usage, duplicate finder, network scan, startup items, "
+                "hashes, battery, USB history, temp cleanup...). Call this FIRST "
+                "with a plain-language query to discover what's available and "
+                "what arguments it takes, then call run_capability. "
+                "Example: list_capabilities(query='disk space')."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string",
+                              "description": "What you want to do, e.g. 'disk space'. "
+                                             "Empty lists everything."},
+                },
+                "required": [],
+            },
+            function=lambda query="": _broker.format_search(query),
+            category="capability",
+        ))
+
+        # Marked risky so the agent's confirm hook prompts before ANY capability
+        # runs. The catalog additionally tags machine-modifying entries
+        # `safety: write`; those are the ones where a y/N really matters.
+        reg.register(ToolSchema(
+            name="run_capability",
+            description=(
+                "Run one toolkit utility discovered via list_capabilities. "
+                "Pass its exact name and its arguments. "
+                "Example: run_capability(name='disk_usage', args={'path': 'D:/'})."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string",
+                             "description": "Capability name from list_capabilities"},
+                    "args": {"type": "object",
+                             "description": "Arguments for the capability", "default": {}},
+                },
+                "required": ["name"],
+            },
+            # NOT blanket-risky: read-only capabilities run straight through,
+            # which is the point of classifying them. The broker asks for
+            # confirmation per capability (writes, plus anything flagged) and
+            # refuses outright when no hook is available.
+            function=lambda name, args=None: _broker.run(
+                name, args or {}, confirm=confirm_capability),
+            category="capability",
+        ))
 
     reg.register(ToolSchema(
         name="grep",

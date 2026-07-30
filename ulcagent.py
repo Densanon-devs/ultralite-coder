@@ -286,6 +286,14 @@ def _build_agent(mgr: ModelManager, workspace: Path):
             toolset = sys.argv[_i + 1]
         elif _a.startswith("--toolset="):
             toolset = _a.split("=", 1)[1]
+    # `--assistant` is sugar for `--toolset assistant`: the computer-assistant
+    # profile (machine-wide locate + read/browse/search/shell, no write tools).
+    if "--assistant" in sys.argv and toolset is None:
+        toolset = "assistant"
+    # `--hybrid` is the daily-driver computer profile: assistant's reach PLUS
+    # policy-gated create/move/edit and DensAssistant recall.
+    if "--hybrid" in sys.argv and toolset is None:
+        toolset = "hybrid"
     # Mission tracking: explicit via --mission, OR auto-engage if a mission
     # file already exists in the workspace (so resuming "just works" even
     # without the flag). When engaged, the `mission` tool is registered AND
@@ -334,6 +342,38 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         print(f"  {_dim('-> ' + ('applied' if approved else 'rejected'))}")
         return approved
 
+    # Hybrid mode may write outside the workspace, so it carries an explicit
+    # allowlist. Every other profile passes None, which keeps the legacy
+    # workspace-relative behaviour byte-for-byte unchanged.
+    _write_policy = None
+    if toolset == "hybrid":
+        from engine.write_policy import WritePolicy
+        _write_policy = WritePolicy.load(workspace)
+
+    def _confirm_capability(cap, args):
+        """Approve one toolkit capability.
+
+        Only reached for write-class or explicitly-flagged capabilities —
+        read-only ones run without a prompt, which is the point of classifying
+        them. Defined before build_default_registry, same as _confirm_edit,
+        because the registry captures it by name at construction time.
+        """
+        _spinner.stop()
+        args_s = ", ".join(f"{k}={str(v)[:60]}" for k, v in (args or {}).items())
+        label = f"{cap.name}({args_s})" if args_s else cap.name
+        kind = "MODIFIES THIS MACHINE" if cap.is_write else "reaches beyond this machine"
+        if auto_yes:
+            print(f"\n  {_yellow('[capability auto-approved]')} {label}")
+            return True
+        print(f"\n  {_yellow('[capability]')} {label}")
+        print(f"  {_dim(cap.summary)}")
+        print(f"  {_yellow(kind)} {_dim('via ' + str(cap.script_path))}")
+        try:
+            answer = input(f"  {_yellow('Approve? [y/N]')} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        return answer in ("y", "yes")
+
     registry = build_default_registry(
         workspace, memory=memory,
         ask_user_fn=_ask_user,
@@ -343,10 +383,15 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         enable_mission=enable_mission,
         toolset=toolset,
         confirm_edit=_confirm_edit if review_edits else None,
+        confirm_capability=_confirm_capability,
+        write_policy=_write_policy,
     )
 
-    # Add system tools for the general profile
-    if profile == "general":
+    # Add system tools for the general profile — but NOT in assistant mode,
+    # where `locate` + the capability catalog already cover this ground and the
+    # 4 extra schemas would push the profile toward the accuracy cliff (and
+    # `disk_usage` collided with a catalogued capability name).
+    if profile == "general" and toolset != "assistant":
         _register_system_tools(registry)
 
     # Load plugins
@@ -807,30 +852,29 @@ _context_files: dict[str, str] = {}  # path -> content, injected into system pro
 
 
 def _inject_project_index(agent, workspace: Path):
-    """Scan workspace and add a file tree to the agent's system prompt."""
+    """Scan workspace and add a file tree to the agent's system prompt.
+
+    Only the first 60 entries reach the prompt, so the scan is capped too —
+    `sorted(workspace.rglob("*"))` used to materialise and sort every path in
+    the tree (descending into node_modules and .git) before the 60-entry break
+    ever ran, which cost ~30s on a 45k-file directory.
+    """
+    files, truncated = _scan_workspace_files(workspace, _SNAPSHOT_MAX_FILES)
     entries = []
-    try:
-        for p in sorted(workspace.rglob("*")):
-            if any(skip in p.parts for skip in (
-                ".git", "__pycache__", "node_modules", ".venv", "dist",
-                "build", ".egg-info", ".tox",
-            )):
-                continue
-            if p.is_file():
-                rel = str(p.relative_to(workspace)).replace("\\", "/")
-                size = p.stat().st_size
-                if size > 1024 * 1024:
-                    label = f"{size / (1024*1024):.1f}MB"
-                elif size > 1024:
-                    label = f"{size // 1024}KB"
-                else:
-                    label = f"{size}B"
-                entries.append(f"  {rel} ({label})")
-                if len(entries) >= 60:
-                    entries.append(f"  ... and more files")
-                    break
-    except OSError:
-        return
+    for rel, size in sorted(files):
+        if size > 1024 * 1024:
+            label = f"{size / (1024*1024):.1f}MB"
+        elif size > 1024:
+            label = f"{size // 1024}KB"
+        else:
+            label = f"{size}B"
+        entries.append(f"  {rel.replace(os.sep, '/')} ({label})")
+        if len(entries) >= 60:
+            entries.append("  ... and more files")
+            break
+    else:
+        if truncated:
+            entries.append("  ... and more files")
     if entries:
         tree = "\n".join(entries)
         agent.system_prompt_extra += (
@@ -1024,32 +1068,139 @@ def _startup_greeting(workspace: Path):
 
 # ── Undo system ──────────────────────────────────────────────────
 
-_undo_snapshot: dict[str, bytes] = {}  # relative_path -> content bytes
+# The snapshot holds file CONTENT in RAM, so it has to be bounded. Pointing
+# ulcagent at a big tree (D:/LLCWork holds multi-GB .gguf models, APKs, videos)
+# used to read every byte of every file into a dict: read_bytes() on a 9 GB
+# model raises MemoryError, which is NOT an OSError, so it escaped the handler
+# here and killed the REPL before the first goal ever ran.
+_SNAPSHOT_MAX_FILE_BYTES = 2 * 1024 * 1024        # per file — bigger isn't source
+_SNAPSHOT_MAX_TOTAL_BYTES = 128 * 1024 * 1024     # whole snapshot
+# Above this file count the workspace isn't a project — it's a holding zone
+# (D:/LLCWork itself is ~45k files across 30+ repos). Snapshotting that per
+# goal costs minutes and hundreds of MB, so /undo turns itself off instead.
+_SNAPSHOT_MAX_FILES = 5000
+
+_SNAPSHOT_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", "venv", "env",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".cache",
+    ".idea", ".vscode", "dist", "build", "target", ".next", ".nuxt",
+    ".expo", ".gradle", "site-packages", ".eggs", "models",
+})
+
+# Binary/artifact suffixes never worth snapshotting — nobody /undo's a model
+# weight or an APK, and these are exactly the files that blow up memory.
+_SNAPSHOT_SKIP_SUFFIXES = frozenset({
+    ".gguf", ".bin", ".safetensors", ".pt", ".pth", ".ckpt", ".onnx",
+    ".npy", ".npz", ".faiss", ".index", ".pack", ".pyc", ".pyo", ".pyd",
+    ".so", ".dylib", ".dll", ".exe", ".msi", ".lib", ".a", ".o", ".obj",
+    ".zip", ".7z", ".gz", ".bz2", ".xz", ".tar", ".rar", ".whl", ".jar",
+    ".apk", ".aab", ".ipa", ".iso", ".dmg",
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".mp3", ".wav", ".m4a", ".flac",
+    ".pdf", ".psd", ".ai", ".sketch",
+    ".db", ".sqlite", ".sqlite3", ".mdb", ".dat",
+})
+
+_undo_snapshot: dict[str, bytes] = {}   # relative_path -> content bytes (restorable)
+_undo_known: set[str] = set()           # every file seen, captured or skipped
+_undo_skipped: list[str] = []           # seen but not captured (not restorable)
+_undo_complete: bool = False            # False => walk truncated, don't delete orphans
+_snapshot_warned: set[str] = set()      # workspaces we've already warned about
+
+
+def _scan_workspace_files(workspace: Path, limit: int) -> tuple[list[tuple[str, int]], bool]:
+    """List (relative_path, size) for every non-noise file under `workspace`.
+
+    Uses os.scandir so sizes come from the directory enumeration already done by
+    the walk (free on Windows) instead of a stat() syscall per file. Stops the
+    moment `limit` files are exceeded and reports that via the second return
+    value — bailing early is what keeps a 45k-file tree from costing 30s.
+    """
+    out: list[tuple[str, int]] = []
+    stack = [str(workspace)]
+    root = str(workspace)
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if (entry.name not in _SNAPSHOT_SKIP_DIRS
+                                    and not entry.name.endswith(".egg-info")):
+                                stack.append(entry.path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        rel = os.path.relpath(entry.path, root)
+                        out.append((rel, entry.stat(follow_symlinks=False).st_size))
+                        if len(out) > limit:
+                            return out, True
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return out, False
 
 
 def _snapshot_workspace(workspace: Path):
-    """Capture all file contents before a goal runs."""
+    """Capture workspace file contents before a goal runs, for /undo.
+
+    Bounded by design. Files over `_SNAPSHOT_MAX_FILE_BYTES` and known-binary
+    suffixes are recorded in `_undo_known` (so /undo won't mistake them for
+    files the goal created) but their bytes are not held. If the workspace has
+    more than `_SNAPSHOT_MAX_FILES` files it isn't a project, so /undo declines
+    rather than stalling the REPL for minutes on every goal.
+    """
+    global _undo_complete
     _undo_snapshot.clear()
-    try:
-        for p in workspace.rglob("*"):
-            if not p.is_file():
-                continue
-            if any(skip in p.parts for skip in (
-                ".git", "__pycache__", "node_modules", ".venv",
-            )):
-                continue
-            rel = str(p.relative_to(workspace))
-            try:
-                _undo_snapshot[rel] = p.read_bytes()
-            except OSError:
-                pass
-    except OSError:
-        pass
+    _undo_known.clear()
+    _undo_skipped.clear()
+    _undo_complete = False
+
+    files, too_many = _scan_workspace_files(workspace, _SNAPSHOT_MAX_FILES)
+
+    key = str(workspace)
+    warn = key not in _snapshot_warned
+
+    if too_many:
+        # Nothing captured and nothing "known", so /undo reports having nothing
+        # to restore instead of silently believing an empty workspace.
+        if warn:
+            _snapshot_warned.add(key)
+            print(f"  {_dim(f'/undo disabled: {workspace} holds over {_SNAPSHOT_MAX_FILES} files. cd into a project directory for undo support.')}")
+        return
+
+    total = 0
+    oversize = 0
+    for rel, size in files:
+        _undo_known.add(rel)
+        if Path(rel).suffix.lower() in _SNAPSHOT_SKIP_SUFFIXES:
+            _undo_skipped.append(rel)
+            continue
+        if size > _SNAPSHOT_MAX_FILE_BYTES or total + size > _SNAPSHOT_MAX_TOTAL_BYTES:
+            _undo_skipped.append(rel)
+            oversize += 1
+            continue
+        try:
+            _undo_snapshot[rel] = (workspace / rel).read_bytes()
+            total += size
+        except (OSError, MemoryError):
+            # MemoryError is not an OSError — catching only OSError here is what
+            # crashed the REPL on the first goal against a tree holding .gguf
+            # model files.
+            _undo_skipped.append(rel)
+
+    _undo_complete = True
+
+    if warn and oversize:
+        _snapshot_warned.add(key)
+        plural = "s" if oversize != 1 else ""
+        print(f"  {_dim(f'/undo covers {len(_undo_snapshot)} text files; {oversize} large file{plural} not restorable')}")
 
 
 def _do_undo(workspace: Path):
     """Restore workspace to the pre-goal snapshot."""
-    if not _undo_snapshot:
+    if not _undo_known:
         print(f"  {_dim('Nothing to undo.')}")
         return
     restored = 0
@@ -1061,22 +1212,43 @@ def _do_undo(workspace: Path):
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_bytes(content)
                 restored += 1
-        except OSError:
+        except (OSError, MemoryError):
             pass
-    # Remove files that didn't exist in snapshot
-    for p in workspace.rglob("*"):
-        if not p.is_file():
-            continue
-        if any(skip in p.parts for skip in (".git", "__pycache__", "node_modules", ".venv")):
-            continue
-        rel = str(p.relative_to(workspace))
-        if rel not in _undo_snapshot:
-            try:
-                p.unlink()
-                restored += 1
-            except OSError:
-                pass
-    print(f"  {_green(f'Undone:')} {restored} file{'s' if restored != 1 else ''} restored to pre-goal state.")
+
+    # Remove files the goal created. Membership is tested against _undo_known
+    # (every file the snapshot SAW), never _undo_snapshot (only the files whose
+    # bytes it kept) — otherwise every large/binary file the snapshot skipped
+    # would look "new" here and get deleted.
+    deleted = 0
+    if _undo_complete:
+        for dirpath, dirnames, filenames in os.walk(workspace, onerror=lambda e: None):
+            dirnames[:] = [d for d in dirnames
+                           if d not in _SNAPSHOT_SKIP_DIRS and not d.endswith(".egg-info")]
+            for name in filenames:
+                p = Path(dirpath) / name
+                try:
+                    rel = str(p.relative_to(workspace))
+                except ValueError:
+                    continue
+                if rel in _undo_known:
+                    continue
+                try:
+                    p.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+
+    total = restored + deleted
+    plural = "s" if total != 1 else ""
+    msg = f"  {_green('Undone:')} {total} file{plural} restored to pre-goal state."
+    if deleted:
+        dplural = "s" if deleted != 1 else ""
+        msg += f" {_dim(f'({deleted} created file{dplural} removed)')}"
+    print(msg)
+    if _undo_skipped:
+        print(f"  {_dim(f'{len(_undo_skipped)} file(s) were outside the snapshot and left untouched.')}")
+    if not _undo_complete:
+        print(f"  {_dim('Snapshot was partial — files created by the goal were not removed.')}")
     _undo_snapshot.clear()
 
 
@@ -1661,6 +1833,10 @@ _HELP_TEXT = """
     - Test workflows: run tests, read failures, fix, re-run
     - Shell commands: build, lint, deploy (asks permission first)
     - System info: disk usage, processes, environment, recent files
+    - Finding anything on the machine by name (--hybrid / --assistant)
+    - Moving, creating and editing files outside the current project,
+      inside allowlisted roots and reversible with --revert-last (--hybrid)
+    - Recalling what you saw, said or worked on, from DensAssistant (--hybrid)
 
   {bold}Where it struggles (use a cloud AI instead):{end}
     - Files over ~200 lines (break into smaller reads)
@@ -1681,6 +1857,32 @@ _HELP_TEXT = """
     >>> Add rate limiting middleware
     >>> Write tests for the auth endpoints
 
+  {bold}Hybrid mode (search + move + create + edit + personal memory):{end}
+    --hybrid        The daily-driver computer profile. 10 tools: machine-wide
+                    `locate`, read/list/grep, create/edit/`move_path`, the
+                    toolkit broker, and `recall` (DensAssistant memory).
+                    Writes are limited to allowlisted roots and journaled.
+                      ulcagent --hybrid "move the Acts 16 clips into G:/My Drive"
+                      ulcagent --hybrid "what was I working on yesterday?"
+    --write-roots   Show which directories may be written to.
+    --write-root P  Allow writes under P as well (persisted).
+    --mutations     List recent create/move/edit operations.
+    --revert-last N Undo the last N mutations (restores from backups).
+
+  {bold}Computer-assistant mode:{end}
+    --assistant     Answer questions about THIS COMPUTER, not just this project.
+                    8-tool profile: machine-wide `locate` + the toolkit
+                    capability broker + read/browse/search/shell. No write
+                    tools, so an assistant session can't edit files.
+                      ulcagent --assistant "where is the densanon llc folder?"
+                      ulcagent --assistant "what's eating disk space on D:?"
+    --reindex       Build the machine-wide filename index (~15s, names only —
+                    no file contents are read). Needed once before `locate`.
+    --index-status  Show index size, age and roots.
+    --keep-going    After each run, relaunch with a FRESH context and continue
+                    the mission until every step is done. Stops itself on a
+                    stalled or over-budget mission. Pair with --mission.
+
   {bold}Startup flags:{end}
     --warm          Keep model loaded between goals (instant, ~10GB VRAM)
     --extended      Enable 21 advanced tools (git, checkpoint, etc.)
@@ -1699,10 +1901,31 @@ _HELP_TEXT = """
     --new-engagement NAME
                     Scaffold a new engagement workspace (scope/, evidence/,
                     findings/, tools/, audit/, report/) and exit.
-    --mission       Enable the `mission` tool — durable multi-step state in
-                    .ulcagent_mission.json that survives across runs and
-                    context compaction. Auto-engages if that file already
-                    exists (so resuming a mission "just works").
+    --toolset NAME  Pick a curated tool profile instead of the default 10.
+                    Authoritative over --extended/--web. Staying near 10 tools
+                    is what keeps accuracy up, so prefer a themed profile over
+                    --extended:
+                      coding    10  the proven default
+                      refactor  16  + rename/read_function/find_defs/usages
+                      git       15  + status/diff/commit/checkpoint/restore
+                      web       12  + web_search/fetch_url
+                      assistant  8  machine-wide, READ-ONLY (== --assistant)
+                      hybrid    10  machine-wide + writes + recall (== --hybrid)
+                      full      29  everything
+
+  {bold}Plugging into DensAssistant:{end}
+    Reading  — `recall` in --hybrid queries DensAssistant's /api/search on
+               127.0.0.1:8777. It uses DensAssistant's own pairing token; if
+               Privacy-Lock is engaged it says so instead of reading anything.
+               Override with DENSASSISTANT_URL / DENSASSISTANT_TOKEN.
+    Acting   — DensAssistant can drive ulcagent's file tools. Add this as an
+               MCP server in its MCP panel:
+                 command: python
+                 args:    -m engine.mcp_server --workspace <dir>
+                 cwd:     D:/LLCWork/ultralight-coder
+               Exposes locate/read_file/create_file/move_path/edit_file/
+               write_roots. The SAME write allowlist applies, and nothing on
+               that path prompts — so the allowlist is the only guard.
 """
 
 
@@ -1812,6 +2035,87 @@ def main():
     except ImportError:
         pass
 
+    # Write-policy management + mutation reversal. All pure I/O, no model load.
+    if "--write-roots" in sys.argv or "--write-root" in sys.argv:
+        from engine.write_policy import (configured_write_roots, save_write_roots)
+        if "--write-root" in sys.argv:
+            idx = sys.argv.index("--write-root")
+            if idx + 1 >= len(sys.argv):
+                print(f"  {_red('error:')} --write-root requires a path")
+                sys.exit(2)
+            new_root = Path(sys.argv[idx + 1]).expanduser()
+            if not new_root.is_dir():
+                print(f"  {_red('error:')} not a directory: {new_root}")
+                sys.exit(2)
+            roots = configured_write_roots()
+            if any(str(r).lower() == str(new_root).lower() for r in roots):
+                print(f"  {_dim('already allowed:')} {new_root}")
+            else:
+                roots.append(new_root)
+                path = save_write_roots(roots)
+                print(f"  {_green('added write root:')} {new_root}")
+                print(f"  {_dim(str(path))}")
+        print(f"\n  {_bold('Writable roots')} {_dim('(hybrid mode; anything else is refused)')}")
+        for r in configured_write_roots():
+            print(f"    {r}")
+        sys.exit(0)
+
+    if "--revert-last" in sys.argv:
+        from engine.write_policy import journal_entries, revert_last
+        idx = sys.argv.index("--revert-last")
+        count = 1
+        if idx + 1 < len(sys.argv) and sys.argv[idx + 1].isdigit():
+            count = int(sys.argv[idx + 1])
+        recent = journal_entries(limit=count)
+        if not recent:
+            print(f"  {_dim('Nothing in the mutation journal.')}")
+            sys.exit(0)
+        print(f"\n  {_bold('Reverting')} {count} mutation(s):")
+        for msg in revert_last(count):
+            print(f"    {msg}")
+        sys.exit(0)
+
+    if "--mutations" in sys.argv:
+        from engine.write_policy import journal_entries
+        entries = journal_entries(limit=25)
+        if not entries:
+            print(f"  {_dim('No mutations recorded yet.')}")
+            sys.exit(0)
+        import datetime as _dt
+        print(f"\n  {_bold('Recent mutations')} {_dim('(newest last)')}")
+        for e in entries:
+            when = _dt.datetime.fromtimestamp(e["ts"]).strftime("%m-%d %H:%M")
+            arrow = f" -> {e['dest']}" if e.get("dest") else ""
+            print(f"    {_dim(when)}  {e['op']:9} {e['path']}{arrow}")
+        sys.exit(0)
+
+    # --reindex / --index-status short-circuit: rebuild or report the
+    # machine-wide file index and exit. No model load — this is pure I/O.
+    if "--reindex" in sys.argv or "--index-status" in sys.argv:
+        from engine import file_index
+        if "--index-status" in sys.argv:
+            st = file_index.status()
+            if not st["exists"]:
+                print(f"  {_dim('No file index yet. Build it with')} ulcagent --reindex")
+                sys.exit(0)
+            age = st["age_sec"]
+            age_txt = f"{age/3600:.1f}h ago" if age else "unknown"
+            print(f"\n  {_bold('File index')}  {st['entries']:,} entries, built {age_txt}"
+                  f"{_red('  [stale]') if st['stale'] else ''}")
+            print(f"  {_dim(st['db_path'])}")
+            for r in st["roots"]:
+                print(f"    {r}")
+            sys.exit(0)
+        roots = file_index.configured_roots()
+        print(f"\n  {_bold('Indexing')} {len(roots)} root(s) — names only, no file contents read:")
+        for r in roots:
+            print(f"    {r}")
+        stats = file_index.build(progress=lambda m: print(f"    {_dim(m)}"))
+        print(f"\n  {_green('Indexed')} {stats['entries']:,} entries in "
+              f"{stats['elapsed_sec']:.1f}s")
+        print(f"  {_dim('Try:')} ulcagent --assistant \"where is the densanon llc folder?\"")
+        sys.exit(0)
+
     # --new-engagement <client-name> short-circuits everything else: scaffold
     # the engagement directory and exit. No model load, no agent build.
     if "--new-engagement" in sys.argv:
@@ -1865,6 +2169,38 @@ def main():
             return
         profile = _detect_profile(goal)
         mgr.ensure_profile(profile)
+
+        # --keep-going: relaunch with a FRESH agent (fresh context) after each
+        # run until the mission's steps are all done, or the policy decides
+        # we're stalled / out of budget. Requires mission tracking, which is
+        # what carries state across the context boundary.
+        if "--keep-going" in sys.argv:
+            from engine.persist_runner import run_until_done
+
+            def _round(round_goal: str, idx: int):
+                # A brand-new Agent per round is the whole point: the previous
+                # run's transcript is discarded and the mission summary (injected
+                # by _build_agent) becomes the only carried context.
+                round_agent = _build_agent(mgr, workspace)
+                _inject_project_index(round_agent, workspace)
+                return _run_one(round_agent, round_goal, workspace=workspace)
+
+            summary = run_until_done(
+                workspace=workspace,
+                goal=goal,
+                run_round=_round,
+                on_event=lambda m: print(f"  {_dim('[keep-going] ' + m)}"),
+            )
+            verdict = summary["decision"]
+            tag = _green("[keep-going] " + verdict) if verdict == "complete" \
+                else _dim("[keep-going] " + verdict)
+            rounds = summary["rounds"]
+            steps = f"{summary['done']}/{summary['total']}"
+            print(f"\n  {tag}: {summary['reason']}")
+            print(f"  {_dim(str(rounds) + ' round(s), ' + steps + ' steps')}")
+            mgr.unload()
+            return
+
         agent = _build_agent(mgr, workspace)
         _run_one(agent, goal, workspace=workspace)
         mgr.unload()
