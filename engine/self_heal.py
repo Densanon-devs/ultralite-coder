@@ -36,6 +36,14 @@ MISSING_IMPORT = "missing_import"      # auto_verify: references undefined names
 CWD_FAILURE = "cwd_failure"
 PARSE_ERROR = "parse_error"            # tool-call JSON parse failed
 TOOL_REJECTED = "tool_rejected"        # generic tool error
+# Task 8, 2026-05-19: finer-grained Python failure modes lifted out of
+# the TRACEBACK catch-all. Each maps to a tailored repair hint so the
+# model's next attempt is class-targeted, not generic.
+IMPORT_ERROR = "import_error"          # ImportError / ModuleNotFoundError
+ASSERTION_FAILURE = "assertion_failure"  # pytest AssertionError / assert X
+TYPE_ERROR = "type_error"              # TypeError (wrong arg types / nones)
+ATTRIBUTE_ERROR = "attribute_error"    # AttributeError ('X' has no attribute 'Y')
+KEY_INDEX_ERROR = "key_index_error"    # KeyError / IndexError on lookup
 UNKNOWN = None                         # not a recognized failure shape
 
 
@@ -87,8 +95,30 @@ def classify_failure(result) -> Optional[str]:
         return SYNTAX_ERROR
     if "old_string not found" in err_low or "old_string did not match" in err_low:
         return STALE_ANCHOR
+    # ImportError / ModuleNotFoundError — check BEFORE NameError because
+    # "ModuleNotFoundError: No module named 'X'" contains "not" + a name
+    # but the right repair is "install/import", not "fix the symbol name".
+    if (
+        "modulenotfounderror" in err_low
+        or "importerror" in err_low
+        or "no module named" in err_low
+    ):
+        return IMPORT_ERROR
     if "nameerror" in err_low or "is not defined" in err_low:
         return NAME_NOT_DEFINED
+    # AttributeError — check before TypeError because "AttributeError"
+    # responses sometimes also embed the offending type name.
+    if "attributeerror" in err_low or "has no attribute" in err_low:
+        return ATTRIBUTE_ERROR
+    if "typeerror" in err_low:
+        return TYPE_ERROR
+    if "keyerror" in err_low or "indexerror" in err_low:
+        return KEY_INDEX_ERROR
+    # AssertionError comes from pytest failures. Surface specifically so
+    # the repair prompt focuses on the failed expectation, not the
+    # general "something raised" hint.
+    if "assertionerror" in err_low or "assert " in err_low:
+        return ASSERTION_FAILURE
     if "no such file or directory" in err_low or "[winerror 2]" in err_low:
         return CWD_FAILURE
     if "traceback" in err_low or 'file "' in err_low and ", line " in err_low:
@@ -186,6 +216,49 @@ _PER_CLASS_HINT = {
         "Two consecutive tool errors. State in one sentence what's "
         "failing and propose a DIFFERENT approach — different tool, "
         "different arguments, or read fresh state before retrying."
+    ),
+    IMPORT_ERROR: (
+        "ImportError twice in a row — Python can't find the module. "
+        "Two paths: (a) the module exists in the workspace but the import "
+        "is wrong — grep for the actual file name and adjust the import "
+        "(`from foo` -> `from src.foo`, etc.); (b) the module is a third-"
+        "party package that isn't installed and CAN'T be installed here — "
+        "rewrite the code using stdlib or workspace-local modules instead. "
+        "Do not retry the same import path."
+    ),
+    ASSERTION_FAILURE: (
+        "Two consecutive pytest AssertionError failures — the code "
+        "computes a value the test rejects. Read the failing test FIRST: "
+        "find the exact assertion line and the expected value. Then re-read "
+        "the function under test and identify the one line whose output "
+        "diverges from expected. Make a MINIMAL edit at that line — do "
+        "not rewrite the function. If the test itself looks wrong, say so "
+        "in the diagnose step and stop; don't silently change the test."
+    ),
+    TYPE_ERROR: (
+        "TypeError twice in a row — wrong argument shape. Read the call "
+        "site AND the function signature. Common causes: (a) None where a "
+        "value is expected (add a guard or fix the producer); (b) a list "
+        "where a single item is expected (or vice versa — index in or "
+        "wrap in a list); (c) wrong arity (missing positional / extra "
+        "kwarg). State which of these applies in one line, then make the "
+        "smallest edit that fixes it."
+    ),
+    ATTRIBUTE_ERROR: (
+        "AttributeError twice in a row — `obj.X` doesn't exist. Two paths: "
+        "(a) you have the wrong object — grep for the class definition and "
+        "find the real attribute name (commonly snake/camel case mismatch, "
+        "or a renamed field); (b) the object is None at the call site — "
+        "trace back to where it was set and fix the producer. Don't "
+        "blindly add hasattr() guards — find the real cause."
+    ),
+    KEY_INDEX_ERROR: (
+        "KeyError / IndexError twice in a row — looking up a key or index "
+        "that isn't there. State in one line whether the lookup is "
+        "(a) a typo (fix the key), (b) a path the producer doesn't always "
+        "fill (use .get() with a default, or guard upstream), or (c) an "
+        "off-by-one on indices (recompute the bounds). Pick one and make "
+        "the smallest edit."
     ),
 }
 

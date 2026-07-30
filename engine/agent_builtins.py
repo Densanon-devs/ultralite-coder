@@ -1076,6 +1076,11 @@ EXTENDED_TOOL_NAMES = frozenset({
     "rename_symbol", "read_function", "checkpoint", "restore", "git_status",
     "git_diff", "git_commit", "add_import", "find_definition", "find_usages",
     "apply_patch", "write_agents_md",
+    # Line-number-anchored edit (Task C2). Extended rather than core: the lean
+    # 10 is the benchmarked set. Deliberately NOT added to the themed
+    # refactor/git profiles either, so their tested sizes don't shift — worth
+    # an A/B before promoting it into `refactor`, where it arguably belongs.
+    "edit_file_hashline",
 })
 WEB_TOOL_NAMES = frozenset({"web_search", "fetch_url"})
 # Machine-wide discovery. Kept OUT of CORE_TOOL_NAMES on purpose: the lean
@@ -1196,6 +1201,13 @@ def build_default_registry(
 
     ws = Workspace(root=Path(workspace_root).resolve())
     reg = ToolRegistry()
+    # Record whether this registry was built with the extended tool set.
+    # The Agent reads this to decide whether to auto-prune the tool block
+    # per goal (Task A4 promotion, 2026-05-19 PM). Lean registries (10
+    # tools) never need pruning; extended registries (21 tools) regress
+    # the 14B from 97.6% to 85.7% per feedback_tool_count_regression.md,
+    # and per-goal pruning is the documented mitigation.
+    reg._extended_tools_enabled = bool(extended_tools)
 
     reg.register(ToolSchema(
         name="read_file",
@@ -1970,6 +1982,133 @@ def build_default_registry(
         },
         function=lambda old_name, new_name, glob_pattern="**/*": _rename_symbol(old_name, new_name, glob_pattern),
         category="refactor",
+    ))
+
+    # ── edit_file_hashline: line-number-anchored edit (Task C2, 2026-05-19) ──
+    #
+    # Encodes the edit anchor as a line NUMBER plus a verification line,
+    # instead of as a substring that must be found. Targets ceiling #1 (JSON
+    # quote-escape mid-run recovery): when the line you want to modify contains
+    # quote-heavy content (Python f-strings, embedded JSON, regex with
+    # backslashes), the model can describe it by its line number without
+    # having to round-trip the literal text through JSON-escape hell.
+    #
+    # Per can.ac harness study (Feb 2026): same model can swing 6.7% -> 68.3%
+    # on SWE-bench from edit-tool format choice alone. This isn't a free
+    # win — hashline can underperform str_replace on simple edits where the
+    # model would have correctly described the surrounding text. So it ships
+    # as an OPT-IN alternative; the operator A/Bs against current edit_file
+    # using the calibration framework (engine.bench_calibration).
+    #
+    # `old_line` is the existing content of the target line (with trailing
+    # newline stripped — the tool handles newlines internally). The tool
+    # FAILS LOUDLY if the file's actual line doesn't match — same safety
+    # contract as edit_file's old_string match check, just on one line.
+
+    def _edit_file_hashline(
+        path: str,
+        line_number: int,
+        old_line: str,
+        new_line: str,
+    ) -> str:
+        p = ws.resolve(path)
+        if not p.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        if not isinstance(line_number, int) or line_number < 1:
+            raise ValueError(
+                f"line_number must be a positive 1-indexed integer; got {line_number!r}"
+            )
+        # newline="" preserves the file's original EOL bytes (otherwise
+        # Python's universal-newlines translation would convert \r\n -> \n
+        # on read, defeating preservation on write).
+        with open(p, encoding="utf-8", errors="replace", newline="") as fh:
+            text = fh.read()
+        # Preserve EOL style (\\n vs \\r\\n). splitlines() drops them; we
+        # reconstruct with the dominant style after the edit.
+        eol = "\r\n" if "\r\n" in text else "\n"
+        lines = text.split(eol)
+        # Files conventionally end with a trailing newline → splitting
+        # produces an empty trailing string we want to preserve.
+        had_trailing_eol = text.endswith(eol)
+        # If the file used "\r\n" + a stray "\n", normalize by splitting on
+        # the dominant EOL only — mixed line-endings stay as-is in untouched
+        # lines.
+        if line_number > len(lines):
+            raise ValueError(
+                f"line_number {line_number} is past EOF (file has "
+                f"{len(lines) - (1 if had_trailing_eol else 0)} lines)"
+            )
+        idx = line_number - 1
+        actual = lines[idx]
+        # Strip trailing carriage returns in case of mixed endings.
+        actual_norm = actual.rstrip("\r")
+        old_norm = (old_line or "").rstrip("\r\n")
+        if actual_norm != old_norm:
+            preview = actual_norm[:80]
+            raise ValueError(
+                f"old_line mismatch at line {line_number}.\n"
+                f"  expected: {old_norm!r}\n"
+                f"  actual:   {preview!r}\n"
+                "Re-read the file with read_file and pass the exact current "
+                "content of the target line as old_line. The tool refuses "
+                "to overwrite on mismatch to avoid corrupting unrelated lines."
+            )
+        # Replace. new_line may already contain internal newlines (multi-
+        # line insertion at this anchor) — we don't split it; whatever the
+        # caller passed lands as the new content for this slot.
+        lines[idx] = new_line if new_line is not None else ""
+        out = eol.join(lines)
+        # newline="" suppresses universal-newlines translation so the EOL
+        # style is preserved verbatim across platforms (Windows would
+        # otherwise rewrite \n -> \r\n via Path.write_text's default).
+        p.write_text(out, encoding="utf-8", newline="")
+        return f"Replaced line {line_number} in {path}"
+
+    reg.register(ToolSchema(
+        name="edit_file_hashline",
+        description=(
+            "Replace a single line in a file by 1-indexed line number. "
+            "Specify the existing line content as `old_line` for safety — "
+            "the tool refuses to overwrite on mismatch. Use this when the "
+            "target line is quote-heavy (f-strings, embedded JSON, regex) "
+            "and the substring form of edit_file would force JSON-escape "
+            "gymnastics. Use the standard edit_file for general targeted "
+            "edits where the surrounding text is simpler to anchor on."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative or absolute path",
+                },
+                "line_number": {
+                    "type": "integer",
+                    "description": "1-indexed line number to replace",
+                    "minimum": 1,
+                },
+                "old_line": {
+                    "type": "string",
+                    "description": (
+                        "Current content of that line (without trailing "
+                        "newline) for safety verification"
+                    ),
+                },
+                "new_line": {
+                    "type": "string",
+                    "description": (
+                        "Replacement line content. May contain internal "
+                        "newlines for multi-line insertion at this anchor."
+                    ),
+                },
+            },
+            "required": ["path", "line_number", "old_line", "new_line"],
+            "additionalProperties": False,
+        },
+        function=lambda path, line_number, old_line, new_line, **_kw: _edit_file_hashline(
+            path, line_number, old_line, new_line
+        ),
+        category="edit",
     ))
 
     # ── read_function: AST-based extraction ──

@@ -69,8 +69,27 @@ class BaseModel:
                 n_gpu_layers=self.config.gpu_layers,
                 n_threads=self.config.threads,
                 n_batch=self.config.batch_size,
+                # flash_attn: O(n²) → O(n) memory + compute on the
+                # attention pass. Measured win on Qwen 2.5 Coder 14B
+                # Q4_K_M / RTX 3060 / llama-cpp-python 0.3.20
+                # (smoke_flash_attn_bench.py, 2026-05-28):
+                #   Cold prompt eval (~3850 input tokens):  85.0s → 10.8s  (-87%)
+                #   Warm decode (200 tokens):                7.5s → 6.6s   (-12%)
+                # Cold-cache turns are the first turn of every agent
+                # goal; warm-cache turns are every subsequent turn.
+                # Mathematically equivalent reorder of the attention
+                # computation — zero quality regression risk.
+                flash_attn=True,
                 verbose=logger.isEnabledFor(logging.DEBUG),
             )
+
+            kv_kwargs = self._kv_cache_kwargs()
+            if kv_kwargs:
+                llama_kwargs.update(kv_kwargs)
+                logger.info(
+                    f"  KV cache: k={getattr(self.config, 'cache_type_k', None) or 'f16'}, "
+                    f"v={getattr(self.config, 'cache_type_v', None) or 'f16'}"
+                )
 
             draft = self._maybe_build_draft_model()
             if draft is not None:
@@ -80,7 +99,8 @@ class BaseModel:
                 self.model = Llama(**llama_kwargs)
                 self._speculative_active = draft is not None
             except TypeError as e:
-                if draft is not None and "draft_model" in str(e):
+                msg = str(e)
+                if draft is not None and "draft_model" in msg:
                     logger.warning(
                         "llama-cpp-python in this environment does not accept "
                         "draft_model kwarg. Loading without native speculative decoding."
@@ -88,6 +108,15 @@ class BaseModel:
                     llama_kwargs.pop("draft_model", None)
                     self.model = Llama(**llama_kwargs)
                     self._speculative_active = False
+                elif kv_kwargs and ("type_k" in msg or "type_v" in msg):
+                    logger.warning(
+                        "llama-cpp-python in this environment does not accept "
+                        "type_k/type_v kwargs. Loading with default F16 KV cache."
+                    )
+                    for k in ("type_k", "type_v"):
+                        llama_kwargs.pop(k, None)
+                    self.model = Llama(**llama_kwargs)
+                    self._speculative_active = draft is not None
                 else:
                     raise
 
@@ -97,6 +126,42 @@ class BaseModel:
             # on very long multi-turn sessions. Callers can enable manually via:
             #   from llama_cpp import LlamaRAMCache
             #   bm.model.set_cache(LlamaRAMCache(capacity_bytes=2*1024**3))
+            #
+            # Append-only KV reuse — Task B4 (2026-05-19), documented and
+            # deferred. The 2026-05-19 research synthesis identifies a 15-40%
+            # per-turn latency reduction available IF we bypass Llama.reset()
+            # between turns and feed only the new-suffix tokens into eval()
+            # while llama.cpp retains the prefix's KV cache from the prior
+            # turn.
+            #
+            # WHY NOT YET SHIPPED:
+            # 1. llama-cpp-python 0.3.20 does NOT expose `n_keep` or
+            #    `cache_prompt` in its high-level Llama() / create_completion()
+            #    API. The path requires bypassing create_completion entirely
+            #    and calling .eval() + .sample_with_kwargs() manually with
+            #    token-level prompt construction.
+            # 2. That refactor loses the streaming, stop-sequence handling,
+            #    grammar=, and repeat_penalty wiring the current generate()
+            #    path provides — all would need re-implementation.
+            # 3. engine.agent.Agent.prefix_hash() (shipped Task A2 today) is
+            #    the cache-key derivation hook B4 will consume. The Agent's
+            #    prefix byte-stability is already proven by
+            #    test_prompt_stability.py — prerequisite work is done.
+            # 4. Cannot validate the wall-clock win autonomously — needs a
+            #    real bench against Qwen 2.5 Coder 14B Q4_K_M on RTX 3060.
+            #    Same risk class as B3 (paired-GGUF draft model).
+            #
+            # IMPLEMENTATION SKETCH for the operator (when GPU time is
+            # available to validate):
+            #   - Add `BaseModel.generate_appendonly(prefix_hash, new_tokens,
+            #     ...)` that on cache_key match calls eval(new_tokens) only,
+            #     on mismatch resets + eval(full).
+            #   - Track current prefix_hash in BaseModel; pass through from
+            #     Agent.run() via Agent.prefix_hash().
+            #   - Validation: re-bench rename_function (the documented
+            #     100s→87s regression case). If B4 produces faster than
+            #     baseline on multi-turn agent runs, the suffix-only path is
+            #     delivering. If not, drop to the C++ llama.cpp APIs.
 
             if self._speculative_active:
                 logger.info("Model loaded successfully (native speculative decoding active)")
@@ -287,6 +352,37 @@ class BaseModel:
             return len(tokens)
         except Exception:
             return len(text) // 4
+
+    # Map llama.cpp GGML quant type names to the integer constants
+    # llama-cpp-python's Llama(type_k=..., type_v=...) accepts. Values pulled
+    # from ggml.h GGML_TYPE_* enum (stable since 2024).
+    _KV_TYPE_CODES = {
+        "f32": 0,
+        "f16": 1,
+        "q4_0": 2,
+        "q4_1": 3,
+        "q5_0": 6,
+        "q5_1": 7,
+        "q8_0": 8,
+    }
+
+    def _kv_cache_kwargs(self) -> dict:
+        """Return llama-cpp-python kwargs for KV cache quant, or {} if defaults."""
+        k = getattr(self.config, "cache_type_k", None)
+        v = getattr(self.config, "cache_type_v", None)
+        out = {}
+        for name, val in (("type_k", k), ("type_v", v)):
+            if val is None:
+                continue
+            key = str(val).lower().strip()
+            if key not in self._KV_TYPE_CODES:
+                logger.warning(
+                    f"Unknown KV cache type {val!r}; ignoring (allowed: "
+                    f"{sorted(self._KV_TYPE_CODES)})"
+                )
+                continue
+            out[name] = self._KV_TYPE_CODES[key]
+        return out
 
     def _maybe_build_draft_model(self):
         """Build a native speculative draft model if configured. Never raises."""

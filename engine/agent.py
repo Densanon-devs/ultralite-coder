@@ -86,6 +86,12 @@ class AgentResult:
     parse_errors_total: int = 0   # tool-call parse errors across all turns (pre-recovery)
     json_recovery_fired: int = 0  # how many times the opt-in json_recovery pass ran
     grammar_turns: int = 0        # tool-call turns that ran with a GBNF grammar attached
+    # G-STEP gate observability (Task 7, 2026-05-19). Dict shape from
+    # engine.tool_gate.GateStats.summary(). Empty when the gate's stats
+    # are unreachable (e.g., registry created outside Agent). The Agent
+    # exposes this so benchmark_agentic.py can include it in the JSON
+    # output without needing a separate channel.
+    gate_stats: dict = field(default_factory=dict)
 
 
 # ── System prompt ───────────────────────────────────────────────
@@ -191,6 +197,41 @@ class Agent:
         workspace_root: Optional[Path] = None,
         memory: Optional[AgentMemory] = None,
         auto_verify_python: bool = True,
+        # After a successful write/edit to a test file (path matches
+        # test_*.py / *_test.py / */tests/*), the agent injects a synthetic
+        # `test_edit_hint` observation suggesting the model run_tests next.
+        # Default ON (promoted 2026-05-19 PM, Task A3 follow-up): the hint
+        # is informative, only fires on successful test-path writes, never
+        # commands, and the model is free to ignore. Addresses the
+        # documented failure mode of "model edits tests, declares done,
+        # never runs them." Cost: ~150 chars per test-edit observation,
+        # zero cost on non-test edits. To opt out:
+        #     Agent(..., suggest_run_tests_on_test_edit=False)
+        # See test_test_edit_hint.py for fire-condition guarantees.
+        suggest_run_tests_on_test_edit: bool = True,
+        # Composes A1 + C4 (2026-05-19). When parse-with-errors returns
+        # only errors (no valid tool calls), and `grammar` is set, and
+        # this flag is True, the agent re-samples ONCE with the grammar
+        # attached. Forces a structurally-valid tool_call on the retry.
+        # Default OFF — same regression-risk reason as A1 (over-constraining
+        # the model can hurt the prose-final-answer flow). Cost: at most
+        # one extra model.generate() call per iteration, and only when
+        # the first-pass parse already failed (rare — <5% of turns).
+        grammar=None,
+        retry_with_grammar_on_parse_fail: bool = False,
+        # Per-goal tool pruning (Task A4 promotion, 2026-05-19 PM).
+        #   None  (default): auto-engage ONLY when the registry was built
+        #                    with extended_tools=True — prune the 21-tool
+        #                    set to the 8-tool floor + top-7 by goal
+        #                    relevance (k=15). Lean 10-tool registries are
+        #                    left untouched (pruning is a no-op there).
+        #   int:             prune to exactly this k regardless of registry
+        #                    mode. Pass 0 to force NO pruning even on
+        #                    extended registries.
+        # The pruned tool block is computed ONCE per run() (from the goal
+        # text) and reused across iterations, preserving the A2 cache
+        # stability invariant.
+        auto_prune_tools_k: Optional[int] = None,
         enable_goal_token_sweep: bool = True,
         require_mutating_action: bool = False,
         # Live self_heal diagnose-and-repair injection on consecutive
@@ -319,6 +360,13 @@ class Agent:
         self.workspace_root = Path(workspace_root) if workspace_root is not None else None
         self.memory = memory
         self.auto_verify_python = auto_verify_python
+        self.suggest_run_tests_on_test_edit = suggest_run_tests_on_test_edit
+        self.grammar = grammar
+        self.retry_with_grammar_on_parse_fail = retry_with_grammar_on_parse_fail
+        self.auto_prune_tools_k = auto_prune_tools_k
+        # Default k applied when auto_prune_tools_k is None AND the registry
+        # is in extended mode. 15 = 8-tool floor + top-7 by relevance.
+        self._DEFAULT_EXTENDED_PRUNE_K = 15
         self.enable_goal_token_sweep = bool(enable_goal_token_sweep)
         self.require_mutating_action = bool(require_mutating_action)
         self.enable_self_heal = bool(enable_self_heal)
@@ -379,6 +427,10 @@ class Agent:
         # Total tool-call parse errors observed across all turns this run
         # (counted pre-recovery). Surfaced on AgentResult for the GBNF A/B.
         self._parse_errors_total: int = 0
+        # Pruned tool block, computed once per run() from the goal when
+        # tool pruning is active (Task A4 promotion). None = use the full
+        # registry block. Reused across iterations to stay cache-stable.
+        self._tool_block_override: Optional[str] = None
 
     # ── json recovery ──
 
@@ -435,6 +487,16 @@ class Agent:
     # ── prompt assembly ──
 
     def _system_prompt(self) -> str:
+        # Cache-stability invariant (Task A2, 2026-05-19):
+        #   _system_prompt() MUST produce byte-identical output across iterations
+        #   of a single run() call. Every part below is set ONCE at run() start
+        #   (_goal_augmentor_block, _memory_block) or is module-level constant
+        #   (_DEFAULT_SYSTEM) or is deterministic per registry (tool_block — see
+        #   ToolRegistry.hermes_system_block which iterates dict-insertion order).
+        #   Tested by test_prompt_stability.py. If you add a part that varies
+        #   per-iteration (timestamps, random IDs, mutable state), B4's
+        #   append-only KV reuse loses its cache hit and the prompt processing
+        #   cost goes from O(suffix) back to O(prefix + suffix) per turn.
         parts = [_DEFAULT_SYSTEM.strip()]
         if self.system_prompt_extra.strip():
             parts.append(self.system_prompt_extra.strip())
@@ -442,10 +504,58 @@ class Agent:
             parts.append(self._goal_augmentor_block.strip())
         if self._memory_block:
             parts.append(self._memory_block)
-        tool_block = self.registry.hermes_system_block()
+        # Use the per-goal pruned block when one was computed at run()
+        # start (Task A4); otherwise the full registry block. The override
+        # is a string set once per run, so this stays cache-stable.
+        if self._tool_block_override is not None:
+            tool_block = self._tool_block_override
+        else:
+            tool_block = self.registry.hermes_system_block()
         if tool_block:
             parts.append(tool_block)
         return "\n\n".join(parts)
+
+    def _resolve_prune_k(self) -> Optional[int]:
+        """Effective tool-prune k for this run, or None for no pruning.
+
+        - Explicit auto_prune_tools_k wins (0 means "no pruning").
+        - Else auto-engage at the extended-mode default ONLY when the
+          registry was built with extended_tools=True.
+        """
+        if self.auto_prune_tools_k is not None:
+            return self.auto_prune_tools_k if self.auto_prune_tools_k > 0 else None
+        if getattr(self.registry, "_extended_tools_enabled", False):
+            return self._DEFAULT_EXTENDED_PRUNE_K
+        return None
+
+    def _compute_tool_block_override(self, goal: str) -> Optional[str]:
+        """Build the pruned Hermes tool block for *goal*, or None to use the
+        full block. Never raises — pruning is an optimization, not a
+        correctness feature, so any failure falls back to the full set."""
+        k = self._resolve_prune_k()
+        if k is None:
+            return None
+        try:
+            pruned = self.registry.enabled_tools_for_goal(goal, k=k)
+            # No-op guard: if pruning didn't actually drop anything, leave
+            # the override unset so the byte-identical full block is used.
+            if len(pruned) >= len(self.registry.enabled_tools()):
+                return None
+            return self.registry.hermes_system_block(pruned)
+        except Exception as exc:
+            logger.warning("tool pruning failed (%s); using full tool set", exc)
+            return None
+
+    def prefix_hash(self) -> str:
+        """Stable hash of the cacheable prompt prefix (system block only).
+
+        Future B4 (append-only KV) will derive cache keys from this. Returned
+        as sha256 hex so a one-byte drift surfaces as a totally different hash
+        — easy to spot in logs and easy to test against. Pure: no side effects,
+        no I/O. Safe to call every iteration.
+        """
+        import hashlib
+        return hashlib.sha256(self._system_prompt().encode("utf-8")).hexdigest()
 
     def _maybe_compact_transcript(self) -> None:
         """Keep the transcript within the configured context budget.
@@ -644,6 +754,62 @@ class Agent:
         if ext in (".yml", ".yaml"):
             return self._verify_yaml(p)
         return None
+
+    # Path patterns that mark a file as a test. Order matters only for
+    # readability — any single match marks the file.
+    _TEST_PATH_PATTERNS = (
+        re.compile(r"(?:^|[/\\])tests?[/\\]"),       # /tests/ or /test/ directory
+        re.compile(r"(?:^|[/\\])test_[^/\\]+\.py$"),  # test_foo.py
+        re.compile(r"(?:^|[/\\])[^/\\]+_test\.py$"),  # foo_test.py
+    )
+
+    @classmethod
+    def _looks_like_test_file(cls, path: str) -> bool:
+        """True if *path* looks like a pytest/unittest target by naming
+        convention. Pure string check — no I/O. Used by the A3 hint."""
+        if not path:
+            return False
+        norm = path.replace("\\", "/")
+        return any(p.search(norm) for p in cls._TEST_PATH_PATTERNS)
+
+    def _maybe_suggest_run_tests(
+        self, call: ToolCall, result: ToolResult
+    ) -> Optional[ToolResult]:
+        """Synthetic `test_edit_hint` after a successful test-file edit
+        (Task A3, 2026-05-19). Opt-in via suggest_run_tests_on_test_edit.
+
+        Fires when:
+          1. The flag is on.
+          2. The call was write_file or edit_file.
+          3. The call succeeded.
+          4. The path looks like a test file.
+
+        Returns None otherwise. The hint is a SUGGESTION — the model
+        decides whether to act on it. We never auto-execute run_tests
+        from inside the agent loop (that would violate the model-decides
+        contract that's load-bearing for the 41/42 baseline)."""
+        if not self.suggest_run_tests_on_test_edit:
+            return None
+        if call.name not in ("write_file", "edit_file"):
+            return None
+        if not result.success:
+            return None
+        path_arg = call.arguments.get("path")
+        if not isinstance(path_arg, str):
+            return None
+        if not self._looks_like_test_file(path_arg):
+            return None
+        return ToolResult(
+            name="test_edit_hint",
+            success=True,
+            content=(
+                f"You just modified the test file {path_arg!r}. The next "
+                "step is to verify your change by calling run_tests "
+                "(preferred over run_bash for any test invocation). If "
+                "you have other edits still pending for this task, "
+                "complete them first, then call run_tests once at the end."
+            ),
+        )
 
     @staticmethod
     def _verify_python(p: Path) -> ToolResult:
@@ -2238,6 +2404,17 @@ class Agent:
                 except Exception as exc:
                     logger.warning(f"augment_for_goal callback raised: {exc!r}")
 
+            # Per-goal tool pruning (Task A4 promotion). Computed once here
+            # from the goal text, then reused across iterations via
+            # _system_prompt(). None = full tool block. Auto-engages for
+            # extended-mode registries; no-op for lean registries.
+            self._tool_block_override = self._compute_tool_block_override(goal)
+            if self._tool_block_override is not None:
+                self._emit(AgentEvent(
+                    "tools_pruned", 0,
+                    payload={"k": self._resolve_prune_k()},
+                ))
+
         if not continue_session and self.memory is not None:
             notes = self.memory.load()
             if notes:
@@ -2344,6 +2521,43 @@ class Agent:
                 )
                 if recovered is not None:
                     response, calls, parse_errors = recovered
+
+            # C4 + A1 compose: if first-pass parsing produced only errors
+            # (no valid calls) AND we have a grammar wired AND the operator
+            # opted in, re-sample ONCE with the grammar attached. This
+            # forces the next response to be a structurally-valid
+            # <tool_call> JSON block. Cost: one extra model.generate() per
+            # iteration, only on the iterations that would have failed
+            # parsing anyway. Default-off (both knobs).
+            if (
+                not calls
+                and parse_errors
+                and self.retry_with_grammar_on_parse_fail
+                and self.grammar is not None
+            ):
+                try:
+                    retry_kwargs = dict(gen_kwargs)
+                    retry_kwargs["grammar"] = self.grammar
+                    retry_response = self.model.generate(prompt, **retry_kwargs)
+                except Exception as exc:
+                    logger.warning(
+                        "Grammar-guided retry failed: %s. Falling through to "
+                        "the original parse_errors handling.", exc,
+                    )
+                    retry_response = None
+                if retry_response:
+                    retry_response = retry_response.strip()
+                    retry_calls, retry_errors = self.registry.parse_with_errors(
+                        retry_response
+                    )
+                    if retry_calls:
+                        self._emit(AgentEvent(
+                            "model_text", iteration,
+                            f"[grammar-retry] {retry_response}",
+                        ))
+                        response = retry_response
+                        calls = retry_calls
+                        parse_errors = retry_errors
 
             # Mid-thought truncation detector for R1-distill-style reasoning
             # models: if the response contains `<think>` with no matching
@@ -2797,6 +3011,11 @@ class Agent:
                     results.append(audit)
                     self._tool_results.append(audit)
                     self._emit(AgentEvent("tool_result", iteration, audit))
+                test_hint = self._maybe_suggest_run_tests(call, result)
+                if test_hint is not None:
+                    results.append(test_hint)
+                    self._tool_results.append(test_hint)
+                    self._emit(AgentEvent("tool_result", iteration, test_hint))
 
             # Surface parser errors as synthetic tool results so the model
             # sees "your malformed call didn't run" and can retry with
@@ -2857,6 +3076,17 @@ class Agent:
         wall = time.monotonic() - start
         self._emit(AgentEvent("stopped", iteration, stop_reason))
 
+        # Extract G-STEP gate observability if the registry has it.
+        gate_stats: dict = {}
+        try:
+            gs = getattr(self.registry, "_gate_state", None)
+            if gs is not None:
+                stats = getattr(gs, "stats", None)
+                if stats is not None and hasattr(stats, "summary"):
+                    gate_stats = stats.summary()
+        except Exception:
+            gate_stats = {}
+
         return AgentResult(
             final_answer=final_answer,
             iterations=iteration,
@@ -2871,6 +3101,7 @@ class Agent:
             parse_errors_total=self._parse_errors_total,
             json_recovery_fired=self._json_recovery_fired,
             grammar_turns=self._grammar_turns,
+            gate_stats=gate_stats,
         )
 
 

@@ -1,0 +1,71 @@
+# Bench config template for Qwen3-30B-A3B (Task 9, 2026-05-19).
+#
+# This is a TEMPLATE — rename to config_bench_qwen3_30b_a3b.yaml after
+# the GGUF lands in models/. The candidate is parked here so the
+# moment the GGUF is present the bench can run with one CLI invocation:
+#
+#   python benchmark_agentic.py \
+#       --config config_bench_qwen3_30b_a3b.yaml \
+#       --repeat 3 --share-model \
+#       --output bench_qwen3_30b_a3b_2026-05-19.json
+#   python -m engine.bench_calibration bench_qwen3_30b_a3b_2026-05-19.json
+#
+# Source for this candidate: project_ultralight_coder_phase14_next.md
+# 2026-05-10 entry (experiment_backlog #79). Front-runner in the parked
+# alternative-model set because HF cofounder credibly demos it running
+# offline at ~Opus-Claude-Code quality on a laptop.
+#
+# Hardware caveat: 30.5B-total / 3.3B-active MoE; Q4_K_M GGUF is ~18.6 GB,
+# exceeds RTX 3060 12 GB VRAM. Will spill to CPU. Expect tok/s well below
+# Qwen 2.5 Coder 14B Q4_K_M (~20 tok/s) — measure first, then judge.
+# Operator floor for daily-driver-grade UX: >= 10 tok/s sustained.
+#
+# Download URLs to verify:
+#   - Unsloth GGUF (likely): https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-GGUF
+#   - bartowski mirror: https://huggingface.co/bartowski/Qwen3-30B-A3B-Instruct-GGUF
+# Pin the exact filename in `path` below before running.
+#
+# Chat template caveat: per project_ultralight_coder_phase14_next.md 2026-05-05
+# (feedback_gpt55_prompt_lifts_dont_transfer was on the Qwen 2.5 path; the
+# Qwen3 family has its own enable_thinking quirk). Pull the merged
+# allanchan339 / froggeric template from HuggingFace rather than the model's
+# stock tokenizer_config.json IF using the chat-template path. ULC's
+# main path constructs prompts manually so this only matters for any
+# experimental Jinja-template comparison.
+
+system:
+  name: Ultralite Code Assistant (Qwen3-30B-A3B bench)
+  version: 0.1.0
+  log_level: INFO
+
+base_model:
+  # FILL IN: exact GGUF filename once downloaded
+  path: models/qwen3-30b-a3b-instruct-q4_k_m.gguf
+  context_length: 16384
+  gpu_layers: 99      # let llama.cpp spill — KV stays on GPU when possible
+  threads: 8
+  temperature: 0.1
+  max_tokens: 1024
+  batch_size: 512
+  # KV-Q8 strongly recommended — 30B partial-CPU runs are slow enough that
+  # any KV pressure spike (the JSON-quote ceiling case) will compound.
+  cache_type_k: q8_0
+  cache_type_v: q8_0
+
+augmentors:
+  enabled: true
+  mode: auto                     # 30B exceeds the 3 GB large-mode threshold
+  examples_dir: data/augmentor_examples
+  model_size_threshold: 1500
+  failure_routing: true
+
+memory:
+  enabled: true
+  short_term:
+    max_turns: 30
+    max_tokens: 2048
+
+fusion:
+  mode: lean
+  chat_format: chatml
+  max_prompt_tokens: 2048

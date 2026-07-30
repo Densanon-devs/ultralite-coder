@@ -30,11 +30,13 @@ def test_legacy_lean_unchanged():
 
 
 def test_legacy_extended_unchanged():
-    # extended_tools=True without a toolset still yields core+extended (22),
-    # exactly as before this feature landed.
+    # extended_tools=True without a toolset still yields core+extended, exactly
+    # as before this feature landed. The count moved 22 -> 23 when master added
+    # edit_file_hashline; the invariant that matters is core|extended, not the
+    # literal number.
     got = _names(extended_tools=True)
     assert got == set(CORE_TOOL_NAMES) | set(EXTENDED_TOOL_NAMES)
-    assert len(got) == 22
+    assert len(got) == 23
 
 
 @pytest.mark.parametrize("toolset", sorted(TOOLSETS))

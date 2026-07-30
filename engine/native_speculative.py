@@ -150,27 +150,90 @@ def _build_prompt_lookup(cfg: NativeSpeculativeConfig) -> Optional[Any]:
 
 def _build_draft_llama(cfg: NativeSpeculativeConfig) -> Optional[Any]:
     """
-    Second-Llama draft-model path is intentionally not implemented.
+    Second-Llama draft-model path is intentionally not yet implemented.
 
-    See the module docstring for the full rationale. TL;DR:
-      - llama-cpp-python 0.3.9's `draft_model` kwarg only accepts
-        LlamaDraftModel subclasses, and the only one shipped is
-        LlamaPromptLookupDecoding.
-      - A raw Llama is not a LlamaDraftModel.
-      - A custom adapter using reset/eval/sample would do a full-context
-        forward pass on every call, costing more than it saves.
-      - The real 2.5x speedups reported on llama.cpp #10466 come from the
-        `llama-speculative-simple` C++ CLI binary, not from Python.
+    UPDATE 2026-05-19 (Task B3 research): the original 0.3.9-era assessment
+    that this path is structurally blocked is partially incorrect. The
+    `LlamaDraftModel` ABC requires only:
 
-    If you want the draft-model speedup today, that's a subprocess-based
-    effort that belongs in its own module (e.g., `benchmark_phase13_cli.py`
-    shelling out to `llama-speculative-simple --model-draft X --model Y`).
+        class LlamaDraftModel(abc.ABC):
+            @abc.abstractmethod
+            def __call__(
+                self, input_ids: npt.NDArray[np.intc], /, **kwargs: Any
+            ) -> npt.NDArray[np.intc]: ...
+
+    A custom subclass wrapping a second `Llama` instance IS implementable.
+    The hard part is the KV-cache state machine:
+
+      1. On first call: `draft.reset()`, `draft.eval(input_ids)`, sample N.
+      2. On subsequent calls, the agent loop's `input_ids` shares a long
+         prefix with the previous call (system + tools + earlier transcript).
+         To get the published ~2x speedup we MUST detect the shared prefix
+         and only `eval()` the suffix, leaving the draft's KV cache intact.
+      3. Wrong prefix-detection logic = silent KV corruption = bad drafts.
+         Llama-cpp's verification step rejects bad drafts (correctness
+         preserved) but wall-clock speedup collapses to zero or negative.
+      4. There is no Python API to introspect the draft's internal KV-cache
+         token-id sequence; we must track it ourselves.
+
+    The implementation isn't shipped because:
+      - Unit tests can verify the state-machine logic against a mock Llama,
+        but cannot verify the real KV state stays consistent under llama.cpp's
+        C++ internals.
+      - Without GPU-time validation, we'd ship code that's unit-test-correct
+        but might be wall-clock-neutral or worse.
+
+    DESIGN SKETCH for the operator to implement when they can bench:
+
+        class PairedGGUFDraftModel(LlamaDraftModel):
+            def __init__(self, draft_path, n_ctx, gpu_layers):
+                self.llm = Llama(model_path=draft_path, n_ctx=n_ctx,
+                                 n_gpu_layers=gpu_layers, ...)
+                self._cached_ids: list[int] = []
+
+            def __call__(self, input_ids, /, **kw) -> NDArray[intc]:
+                ids = input_ids.tolist()
+                # Find longest matching prefix with the cached ids.
+                shared = self._matching_prefix_len(ids)
+                if shared < len(self._cached_ids):
+                    # Divergence — we evaluated past where the host's
+                    # context now is. Must reset.
+                    self.llm.reset()
+                    self.llm.eval(ids)
+                    self._cached_ids = list(ids)
+                elif shared < len(ids):
+                    # Append-only suffix path — cheap.
+                    self.llm.eval(ids[shared:])
+                    self._cached_ids = list(ids)
+                # else: no new tokens — sample anyway
+                drafted: list[int] = []
+                NUM_DRAFT = 10
+                for _ in range(NUM_DRAFT):
+                    tok = self.llm.sample()
+                    drafted.append(tok)
+                    self._cached_ids.append(tok)
+                    self.llm.eval([tok])
+                return np.asarray(drafted, dtype=np.intc)
+
+    Bench protocol when implementing:
+      1. Implement against a small smoke task (Qwen 0.5B drafting itself).
+      2. Verify token sequences match a no-draft baseline exactly (bad
+         drafts must produce identical output, just slower).
+      3. Switch to 0.5B drafting 14B Q4_K_M. Run benchmark_agentic.py
+         --repeat 5 --share-model and compare to baseline tok/s.
+      4. Target: >= 1.6x speedup. Below that, the prefix-detection logic
+         likely has a bug — debug before shipping.
+
+    The community-reported 2.5x speedups (ggml-org/llama.cpp discussion
+    #10466) come from `llama-speculative-simple`, which has the C++
+    batched-verify path. The Python path will be somewhat slower at
+    identical draft acceptance rates because of the per-token round-trip
+    through the Python interpreter.
     """
     logger.warning(
-        "speculative.mode=draft_model is not supported by the native "
-        "llama-cpp-python path. Falling back to no speculative decoding. "
-        "Use mode=prompt_lookup instead, or see experiment_backlog.md for "
-        "the subprocess-based CLI approach."
+        "speculative.mode=draft_model is not yet implemented. See the "
+        "design sketch in engine/native_speculative.py:_build_draft_llama "
+        "for the implementation path. Falling back to no speculative decoding."
     )
     return None
 

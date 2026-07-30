@@ -24,6 +24,12 @@ class BaseModelConfig:
     temperature: float = 0.7
     max_tokens: int = 512
     batch_size: int = 512
+    # KV cache quantization. None = default F16. Q8_0 halves KV VRAM at ~lossless
+    # quality and can stabilize long tool-call chains where F16 KV gets evicted
+    # under context pressure. Accepts "f16" | "q8_0" | "q4_0" | "q5_0" | "q5_1".
+    # Requires llama-cpp-python built with KV quant support; falls back gracefully.
+    cache_type_k: Optional[str] = None
+    cache_type_v: Optional[str] = None
 
 
 @dataclass
@@ -252,6 +258,8 @@ class Config:
                 temperature=bm.get("temperature", self.base_model.temperature),
                 max_tokens=bm.get("max_tokens", self.base_model.max_tokens),
                 batch_size=bm.get("batch_size", self.base_model.batch_size),
+                cache_type_k=bm.get("cache_type_k", self.base_model.cache_type_k),
+                cache_type_v=bm.get("cache_type_v", self.base_model.cache_type_v),
             )
 
         # Router

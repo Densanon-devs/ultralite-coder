@@ -230,6 +230,22 @@ def _decode_with_repair(body: str) -> Optional[dict]:
             if obj is not None:
                 _REPAIR_TIER_COUNTS["tier3_extra_brace"] += 1
                 return obj
+    # Tier 6 (runs BEFORE tier 4): lenient content-array reconstruction for a
+    # COMPLETE write_file array whose lines contain unescaped inner `"`. The
+    # array-of-lines form (`"content": ["line1", "line2", ...]`) sidesteps
+    # NEWLINE escaping, but a line like `print(f"{x}")` still breaks strict
+    # JSON — the string element terminates early and the whole call is dropped.
+    # Since we know the shape, reconstruct the elements textually via the
+    # distinctive `" , "` delimiter, preserving inner quotes verbatim. Ordered
+    # before the LOSSY tier-4 truncation recovery because the inner-quote error
+    # ("Expecting ',' delimiter") also matches tier-4's trigger — and tier-4
+    # would close the array early, silently dropping lines. Tier-6 self-gates to
+    # genuinely complete arrays (it needs a closing `]`), so a real max_tokens
+    # truncation (no closing `]`) returns None here and falls through to tier-4.
+    obj = _try_lenient_content_array(body)
+    if obj is not None:
+        return obj
+
     # Tier 4: Truncated content-array recovery. When max_tokens cuts the
     # model's output mid-string inside a content array like
     #   {"name":"write_file","arguments":{"path":"x.py","content":["line1","line2","li
@@ -272,6 +288,64 @@ def _decode_with_repair(body: str) -> Optional[dict]:
                 return obj
     _REPAIR_TIER_COUNTS["decode_failed"] += 1
     return None
+
+
+# Inter-element boundary in an array-of-lines: a closing quote, a comma, then
+# (optional whitespace/newline) the opening quote of the next element. Far more
+# distinctive than a bare quote and rarely occurs inside one source line.
+_ARRAY_ELEM_SEP_RE = re.compile(r'"\s*,\s*"')
+_NAME_RE = re.compile(r'"name"\s*:\s*"([^"\\]+)"')
+_PATH_RE = re.compile(r'"path"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _unescape_line(s: str) -> str:
+    """Best-effort JSON-string unescape for a single reconstructed line.
+
+    Handles the escapes the model DOES emit correctly (`\\"`, `\\\\`, `\\t`)
+    without choking on the unescaped inner quotes that broke strict decode.
+    Order matters: resolve `\\\\` last so an escaped backslash isn't consumed.
+    """
+    out = s.replace('\\"', '"').replace("\\t", "\t").replace("\\/", "/")
+    return out.replace("\\\\", "\\")
+
+
+def _try_lenient_content_array(body: str) -> Optional[dict]:
+    """Reconstruct a write_file call whose `content` array has unescaped inner
+    quotes. Returns the rebuilt dict, or None if the body doesn't match the
+    expected complete-write_file-content-array shape.
+    """
+    name_m = _NAME_RE.search(body)
+    if not name_m or name_m.group(1) != "write_file":
+        return None
+    content_idx = body.find('"content"')
+    if content_idx == -1:
+        return None
+    bracket_idx = body.find("[", content_idx)
+    if bracket_idx == -1:
+        return None
+    array_end = body.rfind("]")
+    if array_end <= bracket_idx:
+        return None
+    path_m = _PATH_RE.search(body[:content_idx]) or _PATH_RE.search(body)
+    if not path_m:
+        return None
+    inner = body[bracket_idx + 1:array_end].strip()
+    if not inner:
+        return None
+    if inner.startswith('"'):
+        inner = inner[1:]
+    if inner.endswith('"'):
+        inner = inner[:-1]
+    elif inner.endswith('",'):
+        inner = inner[:-2]
+    lines = [_unescape_line(e) for e in _ARRAY_ELEM_SEP_RE.split(inner)]
+    if not lines:
+        return None
+    try:
+        path_val = json.loads('"' + path_m.group(1) + '"')
+    except json.JSONDecodeError:
+        path_val = path_m.group(1)
+    return {"name": "write_file", "arguments": {"path": path_val, "content": lines}}
 
 
 def _try_truncated_array_recovery(body: str) -> Optional[dict]:
@@ -406,6 +480,19 @@ def _scan_bare_json_calls(text: str) -> tuple[list[tuple[dict, str]], list[str]]
             if py_obj is not None and _is_tool_call_obj(py_obj):
                 found.append((py_obj, text[idx:py_end]))
                 i = py_end
+                continue
+            # Tier 6 (bare path): a write_file content-array with unescaped
+            # inner quotes fails raw_decode AND the escape/literal-eval tiers
+            # above. Reconstruct the array-of-lines textually (inner quotes
+            # preserved). Self-gates to a complete write_file array.
+            len_obj = _try_lenient_content_array(text[idx:])
+            if len_obj is not None and _is_tool_call_obj(len_obj):
+                reg = text[idx:]
+                j = reg.rfind("]")
+                while j < len(reg) and reg[j] in "]}\t \n,":
+                    j += 1
+                found.append((len_obj, reg[:j]))
+                i = idx + max(j, 1)
                 continue
             # Probe: does this `{...}` region look like a tool call attempt?
             probe = text[idx : idx + 800]
@@ -609,6 +696,53 @@ def strip_tool_calls(text: str) -> str:
     return _TOOL_CALL_RE.sub("", text).strip()
 
 
+# ── Tool pruning helpers (Task A4, 2026-05-19) ──────────────────
+
+
+# Stopwords excluded from scoring so common English filler doesn't drown
+# out signal. Intentionally short — anything not in here counts as a real
+# token. Tokens shorter than 3 chars are also dropped.
+_PRUNE_STOPWORDS: frozenset = frozenset({
+    "the", "and", "for", "with", "from", "into", "that", "this", "these",
+    "those", "have", "has", "had", "are", "was", "were", "been", "being",
+    "you", "your", "our", "their", "his", "her", "its", "any", "all", "every",
+    "but", "not", "can", "could", "would", "should", "will", "shall",
+    "use", "using", "used", "do", "does", "doing", "make", "made",
+    "be", "is", "of", "to", "in", "on", "at", "by", "as", "or",
+    # Common task verbs that match every tool — too generic to score.
+    "tool", "tools", "file", "files", "code", "function", "functions",
+})
+
+
+def _tokenize_for_pruning(text: str) -> set[str]:
+    """Lowercase + word-split + filter for relevance scoring. Deterministic."""
+    if not text:
+        return set()
+    tokens = re.findall(r"[a-z0-9_]{3,}", text.lower())
+    return {t for t in tokens if t not in _PRUNE_STOPWORDS}
+
+
+def _score_tool_against_goal(tool, goal_tokens: set[str]) -> int:
+    """Lexical overlap score between *tool* and *goal_tokens*. Higher is more
+    relevant. Score = number of distinct goal tokens that appear in the
+    tool's (name + description + parameter property names) corpus."""
+    if not goal_tokens:
+        return 0
+    parts = [tool.name, tool.description]
+    params = tool.parameters or {}
+    props = params.get("properties") or {}
+    parts.extend(props.keys())
+    # Also include property descriptions if present — they leak signal
+    # about what the parameter is for ("regex pattern", "absolute path", etc.)
+    for prop_schema in props.values():
+        if isinstance(prop_schema, dict):
+            desc = prop_schema.get("description") or ""
+            if desc:
+                parts.append(desc)
+    haystack = _tokenize_for_pruning(" ".join(parts))
+    return len(goal_tokens & haystack)
+
+
 # ── Registry ────────────────────────────────────────────────────
 
 
@@ -631,6 +765,16 @@ class ToolRegistry:
         # registry per task run.
         self._gate_config = None  # type: ignore[assignment]
         self._gate_state = None  # type: ignore[assignment]
+        # PostToolUse-style sanitizer (Task 5, 2026-05-19). Default-on,
+        # narrow scope (lone surrogate strip + control-char escape +
+        # 30k-char soft cap). Per-registry instance; opt out by setting
+        # self._sanitizer_config.enabled = False.
+        from engine.post_tool_sanitize import SanitizerConfig
+        self._sanitizer_config = SanitizerConfig()
+        # Set True by build_default_registry(extended_tools=True). The Agent
+        # reads this to auto-prune the tool block per goal (Task A4 promotion,
+        # 2026-05-19 PM). Default False: lean registries don't need pruning.
+        self._extended_tools_enabled: bool = False
 
     def configure_gate(self, config, goal_text: str = "") -> None:
         """Engage the G-STEP confidence gate for this registry.
@@ -661,16 +805,85 @@ class ToolRegistry:
     def enabled_tools(self) -> list[ToolSchema]:
         return [t for t in self._tools.values() if t.enabled]
 
+    # Lean floor set — tools that must ALWAYS appear in the system block
+    # regardless of goal-similarity pruning. These are the core file +
+    # exploration + execution surface; without them the model can't make
+    # progress on any task.
+    DEFAULT_FLOOR_SET: frozenset = frozenset({
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "glob",
+        "grep",
+        "run_tests",
+        "run_bash",
+    })
+
+    def enabled_tools_for_goal(
+        self,
+        goal: str,
+        k: int = 10,
+        floor_set: Optional[frozenset] = None,
+    ) -> list[ToolSchema]:
+        """Return the top-k tools most relevant to *goal*, plus the floor set.
+
+        Per Phase 14 next-steps research (ToolRet ACL 2025, AutoTool Nov 2025):
+        pruning the tool set to ~6-10 goal-relevant entries beats full-schema
+        injection on small models. ULC's tool-count regression
+        (feedback_tool_count_regression.md) confirms the same trend: 21 tools
+        drop the 14B from 97.6% to 85.7%.
+
+        Scoring is intentionally simple — no embedding model, no GPU
+        contention. Lexical token-overlap against tool name + description +
+        parameter property names. Cheap, deterministic, fast (<1ms even
+        with hundreds of tools).
+
+        The floor set is ALWAYS included — these are the eight tools without
+        which the agent can't navigate or modify the workspace. Override via
+        floor_set= to customize.
+
+        Returns tools in: floor-set-first (in registration order), then
+        ranked extras by descending score. Stable across calls for the same
+        goal+registry (deterministic tiebreak by registration order).
+        """
+        floor = floor_set if floor_set is not None else self.DEFAULT_FLOOR_SET
+        enabled = self.enabled_tools()
+        if not enabled:
+            return []
+        # Floor first — preserve registration order.
+        floor_tools = [t for t in enabled if t.name in floor]
+        extras = [t for t in enabled if t.name not in floor]
+        if not extras:
+            return floor_tools
+        # Score extras by lexical overlap with the goal.
+        goal_tokens = _tokenize_for_pruning(goal)
+        scored = [
+            (idx, _score_tool_against_goal(t, goal_tokens), t)
+            for idx, t in enumerate(extras)
+        ]
+        # Sort: highest score first; ties broken by registration order
+        # (idx ascending) so the result is deterministic.
+        scored.sort(key=lambda x: (-x[1], x[0]))
+        remaining_slots = max(0, k - len(floor_tools))
+        kept_extras = [t for _, _, t in scored[:remaining_slots]]
+        return floor_tools + kept_extras
+
     # ── prompt generation ──
-    def hermes_system_block(self) -> str:
+    def hermes_system_block(self, tools: Optional[list[ToolSchema]] = None) -> str:
         """
         Build the exact Qwen 2.5 / Hermes tool-use system-prompt block.
 
         Qwen 2.5's chat template emits tool calls in this format natively —
         matching the format the model was trained on is what unlocks reliable
         tool calling from the 14B without custom parsing gymnastics.
+
+        Pass an explicit *tools* list (e.g. from enabled_tools_for_goal())
+        to render a pruned block. Default behavior (tools=None) renders the
+        full enabled set, preserving the pre-A4 baseline.
         """
-        tools = self.enabled_tools()
+        if tools is None:
+            tools = self.enabled_tools()
         if not tools:
             return ""
         tool_lines = [json.dumps(t.to_hermes_dict(), ensure_ascii=False) for t in tools]
@@ -742,6 +955,16 @@ class ToolRegistry:
             )
         try:
             result = tool.function(**call.arguments)
+            # PostToolUse sanitization (Task 5, 2026-05-19). Cleans lone
+            # surrogates + control chars and soft-truncates oversized
+            # content before the result gets serialized for the next
+            # model turn. Idempotent and skipped for tools in the
+            # opt-out set (e.g. auto_verify). See engine/post_tool_sanitize.py.
+            if self._sanitizer_config is not None and self._sanitizer_config.enabled:
+                from engine.post_tool_sanitize import sanitize_tool_result
+                result = sanitize_tool_result(
+                    call.name, result, self._sanitizer_config
+                )
             return ToolResult(name=call.name, success=True, content=result)
         except TypeError as exc:
             # Signature mismatch the validator missed (e.g. unknown kwarg

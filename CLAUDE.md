@@ -171,6 +171,18 @@ Three mechanisms that make 0.5B models competitive:
 
 ### Agent Mode (engine/agent.py + agent_tools.py + agent_builtins.py + agent_memory.py)
 
+**Terminology** (per the Hugging Face agent glossary, [blog](https://huggingface.co/blog/agent-glossary), 2026-05-28). When debugging an ulcagent failure, naming the layer matters:
+
+| Term | What it is | Where in this codebase |
+|---|---|---|
+| **Scaffold** | The system prompt + tool descriptions + context management — *what the model sees* | YAML augmentors in `data/augmentor_examples/` + `engine/agent.py` system prompt + the `<tools>` block emitted from `agent_tools.py` |
+| **Harness** | The execution loop + tool-call routing + stop logic + guardrails — *how the agent runs* | `engine/agent.py::Agent.run()` + `_execute_call` + `destructive_command_gate` + `self_heal` + `command_audit` |
+| **Tool** | A single-action function the model can invoke | `engine/agent_tools.py` + `engine/agent_builtins.py` (10 core + 11 extended) |
+| **Agent** | Model + Harness as one running unit | `Agent(model=..., registry=...)` |
+| **Skill** | A reusable multi-step bundle, distinct from a single Tool | Not implemented in ulcagent today; `data/augmentor_examples/` YAMLs are the closest analog (multi-step patterns shown via few-shot demos) |
+
+So when a failure surfaces: ask **scaffold problem** (bad system prompt / wrong context) vs **harness problem** (bad tool routing / stop logic) vs **model problem** (the 14B's own ceiling — see Known Ceilings). The right fix depends on which layer is broken; mis-attributing scaffold problems to the harness is a common debugging waste.
+
 Phase 14 ReAct loop. The agent is **loader-agnostic** — it accepts any object with a `.generate(prompt, max_tokens, stop)` method, so the same `Agent` class works against the loaded `BaseModel`, against stub models in unit tests, and against any future inference backend.
 
 **Loop:** Build ChatML prompt from running transcript → `model.generate()` → parse `<tool_call>` tags → if none, that's the final answer; if any, execute every call (with risky-confirm hook), append tool results as a `<|im_start|>tool` turn with Hermes `<tool_response>` blocks, repeat. Budgets: `max_iterations=20`, `max_wall_time=600s`, `max_tokens_per_turn=1024`.
@@ -210,6 +222,8 @@ Phase 14 ReAct loop. The agent is **loader-agnostic** — it accepts any object 
 **Privacy invariant (default):** The entire agent runs in-process. No HTTP, no sockets, no localhost webview. The `remember` notes file is the only thing written outside cwd, and it stays on the local disk.
 
 **Web tools (opt-in):** `--web` registers `web_search` (DuckDuckGo HTML scrape) and `fetch_url` (http/https GET with HTML→text). Both are flagged `risky=True`, so the existing `confirm_risky` callback prompts the user `Approve? [y/N]` before each call (suppressed by `--yes`). `fetch_url` blocks `file://`, non-http schemes, `localhost`, and any hostname that resolves to a private/loopback/link-local/multicast/reserved IP, so the model cannot pivot through these tools to read local files or hit internal services. Stdlib only (`urllib`, `html.parser`) — no new dependencies. See `engine/web_tools.py` and `test_web_tools.py`.
+
+**Egress content gate (always on when `--web` is enabled):** `fetch_url` runs each outbound URL through `densanon.core.egress_gate.check_url` BEFORE the network call fires. The gate pattern-matches for embedded secrets (AWS access keys, GitHub PATs, OpenAI/Anthropic/Stripe keys, JWTs, PEM private keys, presigned URL signatures, OneDrive `authkey=` params, Azure SAS signatures, basic-auth userinfo). High and medium severity matches are refused — the model gets a `WebToolError` it can recover from. Low-severity heuristic matches log a warning without blocking. Defends against the **Copilot Cowork exfiltration class** (Simon Willison 2026-05-26): prompt injection coerces the agent into smuggling a secret it has in working context via an outbound URL parameter. **NOT bypassable by `--yes`** — mirrors `destructive_command_gate`. Lazy-loaded — if `densanon-core` is missing, fetch_url logs a warning and proceeds without the egress check rather than crashing. See `engine/web_tools.py::_check_egress` and the `TestEgressGate` suite in `test_web_tools.py`.
 
 ### Self-improving augmentor pipeline (merged 2026-04-29 to master)
 
@@ -395,6 +409,8 @@ The model excels at **targeted edits** to existing files — reading 20-line fun
 **File size limit:** Files over ~200 lines should be read in sections (`read_file` with `offset`/`limit`), or use `read_function` (extended tools) to extract specific functions by name.
 
 **Tool count:** The lean 10-tool registry scores 100% on benchmarks. The extended 22-tool set drops to ~86% because the extra schemas consume context and confuse the 14B. Prefer `--toolset {refactor,git,web}` to get just the themed tools you need (12–16 total, single-theme) over `--extended` (all 22) — the named profiles keep the registry close to the proven-good size. A/B any profile with `python benchmark_agentic.py --toolset NAME`.
+
+The 10-vs-21 tool drop is one instance of a more general phenomenon — the **observability paradox**: giving an LLM agent *more* context/options at decision time degrades performance vs. concise targeted context. Academic backing: IBM Research + Artificial Analysis ITBench-AA (Hugging Face 2026-05-28, [blog](https://huggingface.co/blog/ibm-research/itbench-aa)) benchmarked frontier models on 59 Kubernetes SRE incident-response tasks and found models taking **more turns score LOWER** (30% pass at ~83 turns vs 37% pass at ~58 turns). The same shape as ulcagent's tool-count regression. The `--extended` gate (off by default) is the right design response: extra capability is opt-in, not the floor. See also `feedback_tool_count_regression.md` in memory.
 
 **Non-Qwen models:** Only Qwen 2.5 family models support the Hermes `<tool_call>` format natively. Gemma 4 was tested and scored 30% (rejected). Future models need Hermes-format fine-tuning or a per-model adapter.
 
