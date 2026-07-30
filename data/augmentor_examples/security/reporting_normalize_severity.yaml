@@ -1,0 +1,121 @@
+domain: security
+category: reporting_normalize_severity
+examples:
+- query: |
+    I run several security tools that each use their own severity words
+    (CRITICAL/HIGH/MEDIUM/LOW, PASS/WARN/FAIL, MISSING, VULNERABLE/SAFE,
+    letter grades A-F, confidence HIGH/MEDIUM). Write a normalizer that maps
+    any of these onto one ordered scale so a combined report is consistent.
+  solution: |
+    Pick one canonical scale and make every other vocabulary map INTO it —
+    never the reverse. Order matters (you'll sort findings by it), so encode
+    rank explicitly. Two rules that trip people up: a *status* like FAIL is a
+    failed control (high), while MISSING is an absent-but-not-actively-failing
+    control (medium); and "confidence" from tech-fingerprinting is NOT
+    severity — a high-confidence "this is nginx" is informational.
+
+    ```python
+    from __future__ import annotations
+
+    CANON = ("critical", "high", "medium", "low", "info")
+    RANK = {s: i for i, s in enumerate(CANON)}
+
+    # Every raw vocabulary token -> canonical. Keys are upper-cased.
+    _MAP = {
+        "CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium",
+        "LOW": "low", "INFO": "info", "INFORMATIONAL": "info",
+        # status-as-severity
+        "FAIL": "high", "MISSING": "medium", "WARN": "medium",
+        "WARNING": "medium", "PARTIAL": "medium",
+        "VULNERABLE": "critical", "PASS": "info", "SAFE": "info",
+        # letter grades (headers/dns/wifi)
+        "A": "info", "B": "low", "C": "medium", "D": "high",
+        "E": "high", "F": "critical",
+        # confidence is not severity
+        "CONFIRMED": "info",
+    }
+
+    def normalize_severity(raw: str) -> str:
+        """Map a raw severity/status/grade token to the canonical scale.
+
+        Unknown tokens fail *toward attention* (medium), not silence.
+        """
+        if not raw:
+            return "medium"
+        return _MAP.get(raw.strip().upper(), "medium")
+
+    def worst(sevs):
+        """Return the most severe canonical severity in an iterable."""
+        return min(sevs, key=lambda s: RANK.get(s, len(CANON)), default="info")
+
+    if __name__ == "__main__":
+        samples = ["CRITICAL", "FAIL", "MISSING", "F", "PASS", "VULNERABLE", "b"]
+        for s in samples:
+            print(f"{s:12} -> {normalize_severity(s)}")
+        print("worst of a report:", worst(["low", "high", "medium"]))
+    ```
+
+    Default unknown → medium, not low: an unrecognized tag is more likely a
+    new tool you haven't mapped than genuine noise, and under-reporting is the
+    expensive failure in security. Keep the map in one module so every tool's
+    output funnels through the same table.
+  tags: [reporting, severity, normalization, findings, triage, pentest]
+  difficulty: medium
+
+- query: |
+    My header/CORS/redirect tools emit JSON with a "status" field
+    (PASS/FAIL/MISSING) and a "critical" boolean, not a severity. Fold those
+    into the same canonical severity so they merge with the CRITICAL/HIGH
+    findings from my other tools.
+  solution: |
+    A boolean `critical` flag *escalates* the status-derived severity — a
+    FAILed control that's also flagged critical (e.g. a session cookie without
+    Secure/HttpOnly) should land as high/critical, not sit at the base "fail"
+    band. Resolve status → base severity first, then let the flag bump it.
+
+    ```python
+    from __future__ import annotations
+
+    CANON = ("critical", "high", "medium", "low", "info")
+    RANK = {s: i for i, s in enumerate(CANON)}
+    _STATUS = {"FAIL": "high", "MISSING": "medium", "PASS": "info", "INFO": "info"}
+
+    def _bump(sev: str) -> str:
+        i = RANK.get(sev, 2)
+        return CANON[max(0, i - 1)]
+
+    def normalize_check(check: dict) -> str:
+        """Map a {status, critical} check dict to a canonical severity."""
+        base = _STATUS.get(str(check.get("status", "")).upper(), "medium")
+        if check.get("critical"):
+            base = _bump(base)          # critical flag escalates one band
+        return base
+
+    def normalize_report(checks: list[dict]) -> list[dict]:
+        out = []
+        for c in checks:
+            sev = normalize_check(c)
+            if sev == "info":
+                continue                # drop passing controls from findings
+            out.append({"title": c.get("header") or c.get("name", "check"),
+                        "severity": sev,
+                        "detail": c.get("detail", c.get("status"))})
+        out.sort(key=lambda f: RANK[f["severity"]])
+        return out
+
+    if __name__ == "__main__":
+        checks = [
+            {"header": "Strict-Transport-Security", "status": "MISSING", "critical": True},
+            {"header": "X-Frame-Options", "status": "MISSING", "critical": False},
+            {"header": "Set-Cookie", "status": "FAIL", "detail": "no Secure/HttpOnly", "critical": True},
+            {"header": "Referrer-Policy", "status": "PASS", "critical": False},
+        ]
+        for f in normalize_report(checks):
+            print(f"{f['severity']:8} {f['title']} — {f['detail']}")
+    ```
+
+    Dropping PASS/info controls from the findings list keeps the report about
+    problems; note the count of passing controls separately in the summary so
+    the client sees you checked them.
+  tags: [reporting, severity, headers, cors, json, normalization, pentest]
+  difficulty: medium

@@ -1,0 +1,51 @@
+domain: agentic
+category: recovery_fstring_nested_quote
+examples:
+- query: 'Build a small pomodoro timer Python package in this directory. Layout: (1)
+    pomodoro/__init__.py (empty package marker), (2) pomodoro/timer.py (Timer class
+    with start(duration_sec), elapsed(), is_done() methods; uses time.monotonic for
+    tracking; injectable clock parameter for testing), (3) pomodoro/storage.py (append_session(path,
+    started_at, duration_sec) and load_sessions(path) using JSON list of dicts), (4)
+    pomodoro/cli.py (argparse subcommands: start DURATION, history; uses Timer + storage;
+    handler functions take args), (5) tests/test_timer.py (pytest tests for Timer
+    using a mock clock — start, elapsed advances, is_done flips), (6) tests/test_storage.py
+    (pytest test for save/load roundtrip using tmp_path), (7) tests/conftest.py with
+    sys.path injection so tests find the pomodoro package. Verify everything works
+    by running pytest at the end.
+
+
+    # Recovery captured from a real run'
+  solution: "When a single-quoted f-string contains another single-quoted literal\n\
+    inside its `{ }` block, Python 3.10/3.11 errors with\n`f-string: expecting '}'`.\
+    \ The fix is to flip the OUTER f-string to\ndouble quotes, leaving the INNER literals\
+    \ single-quoted.\n\nWRONG (failure mode in this run):\n```\nwrite_file args:\n\
+    {\n  \"path\": \"pomodoro/cli.py\",\n  \"content\": [\n    \"#!/usr/bin/env python\"\
+    ,\n    \"\",\n    \"import argparse\",\n    \"from pomodoro.timer import Timer\"\
+    ,\n    \"from pomodoro.storage import append_session, load_sessions\",\n    \"\
+    \",\n    \"def start_handler(args):\",\n    \"    timer = Timer()\",\n    \" \
+    \   timer.start(args.duration)\",\n    \"    session_data = {\",\n    \"     \
+    \   'started_at': timer.elapsed(),\",\n    \"        'duration_sec': args.duration\"\
+    ,\n    \"    }\",\n    \"    append_session('sessions.json', **session_data)\"\
+    ,\n    \"\",\n    \"def history_handler(_):\",\n    \"    sessions = load_sessions('sessions.json')\"\
+    ,\n    \"    for session in sessions:\",\n    \"        print(f'Started at: {session['started_at']},\
+    \ Duration: {session['duration_sec']} seconds')\",\n    \"\",\n    \"if __name__\
+    \ == '__main__':\",\n    \"    parser \n... <+627 chars>\n```\n\nReason this failed:\
+    \ SyntaxError in cli.py line 19: f-string: unmatched '['. NESTED-QUOTE TRAP (Python\
+    \ 3.10/3.11): line 19 has a single-quoted f-string that contains `'` inside its\
+    \ `{ }` expression. Python 3.10 can't pars\n\nRIGHT (the same goal, retried successfully):\n\
+    ```\nedit_file args:\n{\n  \"path\": \"pomodoro/cli.py\",\n  \"old_string\": \"\
+    print(f'Started at: {session['started_at']}, Duration: {session['duration_sec']}\
+    \ seconds')\",\n  \"new_string\": \"print(f\\\"Started at: {session['started_at']},\
+    \ Duration: {session['duration_sec']} seconds\\\")\"\n}\n```\n\nUse the same shape\
+    \ as the RIGHT call when faced with similar\nqueries. The before-and-after pattern\
+    \ teaches the recovery path\ndirectly."
+  tags:
+  - recovery
+  - fstring_nested_quote
+  - edit_file
+  difficulty: medium
+  source: recovery_detector
+  captured_at: 1777240611.1040092
+  failed_iteration: 5
+  fixed_iteration: 10
+  triggering_file: pomodoro/cli.py

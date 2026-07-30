@@ -1,0 +1,129 @@
+domain: security
+category: reporting_findings_extract
+examples:
+- query: |
+    Parse the mixed text output of my security tools into a list of
+    structured finding dicts (title, severity, evidence, remediation). The
+    hard rule: never emit a finding that isn't grounded in the tool output —
+    no invented hosts, CVEs, or severities.
+  solution: |
+    Grounding is the whole game in a client report — one fabricated finding
+    and the client stops trusting the document. Two defenses: (1) parse, don't
+    paraphrase — pull the evidence string straight from the source line; and
+    (2) validate every extracted finding's evidence back against the raw text
+    before you keep it. Treat the model/regex as a *proposer* and the raw text
+    as the *authority*.
+
+    ```python
+    from __future__ import annotations
+    import re
+
+    CANON = {"critical", "high", "medium", "low", "info"}
+    _TAG = re.compile(r"\[(CRITICAL|HIGH|MEDIUM|LOW|INFO)\]", re.I)
+
+    def extract_tagged(raw: str) -> list[dict]:
+        """Extract findings from tools that print [SEVERITY] tags per line."""
+        findings = []
+        for line in raw.splitlines():
+            m = _TAG.search(line)
+            if not m:
+                continue
+            evidence = line.strip()
+            findings.append({
+                "title": _TAG.sub("", line).strip()[:80],
+                "severity": m.group(1).lower(),
+                "evidence": evidence,          # verbatim from source
+                "remediation": "",             # filled by a later pass
+            })
+        return findings
+
+    def validate_grounded(findings: list[dict], raw: str) -> list[dict]:
+        """Drop any finding whose evidence isn't a substring of the source."""
+        src = raw.lower()
+        kept = []
+        for f in findings:
+            ev = str(f.get("evidence", "")).strip().lower()
+            if not ev:
+                continue
+            # require a meaningful anchor (>=8 chars) present verbatim
+            anchor = ev[:40]
+            if anchor and anchor in src and f.get("severity") in CANON:
+                kept.append(f)
+        return kept
+
+    if __name__ == "__main__":
+        raw = (
+            "  [CRITICAL] /.git/config    200  source repo exposed\n"
+            "  [HIGH]     /backup.sql     200  database backup downloadable\n"
+            "  [INFO]     /robots.txt     200\n"
+        )
+        findings = validate_grounded(extract_tagged(raw), raw)
+        for f in findings:
+            print(f['severity'], '::', f['title'])
+    ```
+
+    The `validate_grounded` pass is cheap insurance: if a downstream step
+    (including an LLM writeup) hallucinates a finding, its evidence won't match
+    the source and it gets dropped before it reaches the client.
+  tags: [reporting, findings, extraction, grounding, anti-hallucination, pentest]
+  difficulty: medium
+
+- query: |
+    Some of my tools emit JSON instead of tagged text (deps audit, rate-limit,
+    headers --json). Extract findings from JSON output but keep the same
+    no-fabrication guarantee, and merge with the text-parsed findings.
+  solution: |
+    JSON is easier — the structure is the grounding. Map each tool's schema to
+    the common finding shape explicitly (don't guess field names), and skip
+    rows that are clearly non-findings (e.g. an unpinned-dependency row with an
+    empty vuln id is a hygiene note, not a vuln — tag it low, don't drop it).
+
+    ```python
+    from __future__ import annotations
+    import json
+
+    def from_deps_json(raw: str) -> list[dict]:
+        """audit_deps --format json -> findings."""
+        rows = json.loads(raw[raw.find("["): raw.rfind("]") + 1])
+        out = []
+        for r in rows:
+            if r.get("kind") == "unpinned":
+                out.append({"title": f"unpinned dependency: {r.get('package')}",
+                            "severity": "low", "evidence": json.dumps(r),
+                            "remediation": "pin the version + hash"})
+                continue
+            sev = str(r.get("severity", "")).lower() or "medium"
+            out.append({
+                "title": f"{r.get('package')} {r.get('version')} — {r.get('vuln_id')}",
+                "severity": sev if sev in
+                    {"critical", "high", "medium", "low", "info"} else "medium",
+                "evidence": json.dumps(r),
+                "remediation": f"upgrade to {r.get('fixed_version') or 'a patched release'}",
+            })
+        return out
+
+    def merge_findings(*groups: list[dict]) -> list[dict]:
+        """Concatenate + dedupe by (title, severity)."""
+        seen, merged = set(), []
+        for g in groups:
+            for f in g:
+                key = (f["title"], f["severity"])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(f)
+        rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        merged.sort(key=lambda f: rank.get(f["severity"], 2))
+        return merged
+
+    if __name__ == "__main__":
+        raw = '[{"package":"pyyaml","version":"3.13","vuln_id":"CVE-2020-14343",' \
+              '"severity":"critical","fixed_version":"5.4","kind":"vulnerability"}]'
+        for f in merge_findings(from_deps_json(raw)):
+            print(f["severity"], "::", f["title"])
+    ```
+
+    Explicit per-tool adapters beat a generic "find the severity field"
+    heuristic: schemas drift, and a wrong field silently mislabels severity.
+    One small function per tool is boring and correct.
+  tags: [reporting, findings, json, deps, merge, grounding, pentest]
+  difficulty: medium

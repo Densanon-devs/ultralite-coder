@@ -1,0 +1,35 @@
+domain: agentic
+category: recovery_missing_import
+examples:
+- query: 'Fix three bugs in this project. (1) storage.py redefines the Bookmark class
+    as a regular class with __init__ — instead it should import Bookmark from bookmark.py
+    and use that dataclass. Remove the duplicate class definition in storage.py. (2)
+    cli.py defines a function named list() which shadows the Python builtin — rename
+    it to list_bookmarks(). Update the set_defaults(func=...) line accordingly. (3)
+    cli.py at the bottom parses args but never dispatches to the handler — add an
+    args.func(args) call after parse_args, and update each handler signature to take
+    an args argument and read fields from it (e.g. add(args) -> args.url, args.title).
+
+
+    # Recovery captured from a real run'
+  solution: "When a write_file produces a file referencing names that aren't\nimported,\
+    \ auto_verify catches it. The fix is to prepend the missing\nimport via edit_file\
+    \ with empty `old_string`.\n\nWRONG (failure mode in this run):\n```\nedit_file\
+    \ args:\n{\n  \"path\": \"cli.py\",\n  \"old_string\": \"set_defaults(func=list)\"\
+    ,\n  \"new_string\": \"set_defaults(func=list_bookmarks)\"\n}\n```\n\nReason this\
+    \ failed: syntax OK but cli.py references undefined names: title, url. You MUST\
+    \ add the missing imports to cli.py ITSELF, not to __init__.py or any other file\
+    \ — Python imports are per-file and are NOT shared ac\n\nRIGHT (the same goal,\
+    \ retried successfully):\n```\nread_file args:\n{\n  \"path\": \"cli.py\"\n}\n\
+    ```\n\nUse the same shape as the RIGHT call when faced with similar\nqueries.\
+    \ The before-and-after pattern teaches the recovery path\ndirectly."
+  tags:
+  - recovery
+  - missing_import
+  - read_file
+  difficulty: medium
+  source: recovery_detector
+  captured_at: 1777222689.5974262
+  failed_iteration: 3
+  fixed_iteration: 7
+  triggering_file: cli.py

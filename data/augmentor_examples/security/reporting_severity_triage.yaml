@@ -1,0 +1,136 @@
+domain: security
+category: reporting_severity_triage
+examples:
+- query: |
+    My tools tag raw severities, but real severity is contextual. Write a
+    triage pass that adjusts a finding's severity based on context — so a
+    combination like "CORS reflects arbitrary Origin AND allows credentials"
+    becomes critical, while a lone "missing X-Frame-Options" stays medium.
+  solution: |
+    The base severity a scanner emits is a prior; context is the evidence that
+    updates it. Encode the well-known escalation/de-escalation rules as
+    explicit predicates over the finding + its siblings, so the judgment is
+    auditable (a client will ask "why critical?"). Never silently downgrade a
+    scanner's critical without a recorded reason.
+
+    ```python
+    from __future__ import annotations
+
+    RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    UNRANK = {v: k for k, v in RANK.items()}
+
+    def _set(sev: str) -> int:
+        return RANK.get(sev, 2)
+
+    def triage(finding: dict, siblings: list[dict]) -> dict:
+        """Return finding with adjusted severity + a 'rationale' explaining why."""
+        sev = _set(finding["severity"])
+        blob = (finding.get("title", "") + " " + finding.get("evidence", "")).lower()
+        rationale = []
+
+        # Escalations (context makes it worse).
+        if "credential" in blob and ("reflect" in blob or "origin" in blob):
+            sev = min(sev, RANK["critical"])
+            rationale.append("cross-origin creds exposure = account-takeover primitive")
+        if "sql" in blob and ("sleep" in blob or "syntax error" in blob):
+            sev = min(sev, RANK["critical"])
+            rationale.append("confirmed injectable (time/error based)")
+        if "rate" in blob and "login" in blob:
+            sev = min(sev, RANK["high"])
+            rationale.append("no rate-limit on auth = credential stuffing")
+        if ".git" in blob or ".env" in blob:
+            sev = min(sev, RANK["critical"])
+            rationale.append("source/secret exposure")
+
+        # De-escalations (context makes it noise), only from >= high.
+        lone_header = ("x-frame-options" in blob or "referrer-policy" in blob)
+        if lone_header and sev < RANK["medium"]:
+            sev = RANK["medium"]
+            rationale.append("defense-in-depth header, not directly exploitable")
+        if "confidence" in blob and "version" not in blob:
+            sev = RANK["info"]
+            rationale.append("tech fingerprint is informational, not a vuln")
+
+        out = dict(finding)
+        out["severity"] = UNRANK[sev]
+        out["rationale"] = "; ".join(rationale) or "scanner severity retained"
+        return out
+
+    if __name__ == "__main__":
+        report = [
+            {"title": "CORS origin reflection", "severity": "high",
+             "evidence": "ACAO reflects Origin, credentials true"},
+            {"title": "Missing X-Frame-Options", "severity": "high", "evidence": "missing"},
+            {"title": "Server: nginx", "severity": "medium", "evidence": "confidence HIGH"},
+        ]
+        for f in report:
+            t = triage(f, report)
+            print(f"{t['severity']:8} {t['title']}  <- {t['rationale']}")
+    ```
+
+    Record the rationale on every finding you move. A report where severities
+    are adjusted but the reasoning is invisible reads as arbitrary; one where
+    each move cites the rule reads as expertise.
+  tags: [reporting, severity, triage, context, findings, pentest]
+  difficulty: hard
+
+- query: |
+    Add a de-duplication + roll-up step: the same root cause often shows up as
+    many low findings across hosts (e.g. TLS 1.0 enabled on 40 endpoints).
+    Collapse those into one finding with an affected-hosts list, and roll the
+    severity up if the count is large.
+  solution: |
+    Forty instances of the same weak-TLS config is one finding with forty
+    hosts, not forty findings — presenting it as forty inflates the count and
+    buries the real signal. Group by a normalized root-cause key, and let scale
+    bump severity one band (a config that's wrong everywhere is a systemic
+    issue, not a per-host slip).
+
+    ```python
+    from __future__ import annotations
+    import re
+    from collections import defaultdict
+
+    RANK = ["critical", "high", "medium", "low", "info"]
+
+    def _root_key(f: dict) -> str:
+        """Normalize a finding to its root cause (strip host/IP/port specifics)."""
+        t = f.get("title", "").lower()
+        t = re.sub(r"\b\d{1,3}(\.\d{1,3}){3}\b", "", t)      # IPs
+        t = re.sub(r":\d+\b", "", t)                          # ports
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    def rollup(findings: list[dict], scale_threshold: int = 10) -> list[dict]:
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for f in findings:
+            groups[_root_key(f)].append(f)
+
+        out = []
+        for key, group in groups.items():
+            hosts = sorted({g.get("host", "?") for g in group})
+            sev = min(group, key=lambda g: RANK.index(g["severity"]))["severity"]
+            if len(hosts) >= scale_threshold and RANK.index(sev) > 0:
+                sev = RANK[RANK.index(sev) - 1]               # systemic bump
+            out.append({
+                "title": group[0]["title"],
+                "severity": sev,
+                "affected_hosts": hosts,
+                "instances": len(group),
+            })
+        out.sort(key=lambda f: RANK.index(f["severity"]))
+        return out
+
+    if __name__ == "__main__":
+        findings = [{"title": "TLS 1.0 enabled", "severity": "medium",
+                     "host": f"10.0.0.{i}"} for i in range(12)]
+        for f in rollup(findings):
+            print(f"{f['severity']:8} {f['title']} x{f['instances']} "
+                  f"({len(f['affected_hosts'])} hosts)")
+    ```
+
+    Keep the full host list in the finding even after rollup — the client's
+    remediation team needs the exact targets, and re-tests check every host,
+    not just the exemplar.
+  tags: [reporting, findings, dedup, rollup, severity, pentest]
+  difficulty: hard

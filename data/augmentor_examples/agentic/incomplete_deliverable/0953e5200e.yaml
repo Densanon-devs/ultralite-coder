@@ -1,0 +1,38 @@
+domain: agentic
+category: address_every_numbered_requirement
+examples:
+- query: 'Build a bookmark manager CLI from scratch in this directory. Files needed:
+    1. bookmark.py with a Bookmark dataclass (id: int, url: str, title: str, tags:
+    list[str] using field(default_factory=list)). 2. storage.py imports Bookmark from
+    bookmark.py (DO NOT redefine it). Has load_bookmarks(path) and save_bookmarks(path,
+    bookmarks) using JSON. 3. cli.py with argparse subcommands: add URL TITLE, list,
+    delete ID. Each handler is handler(args) reading args.url etc. After parser.parse_args()
+    call args.func(args). 4. test_bookmarks.py with pytest tests for Bookmark creation
+    and save/load roundtrip. 5. Run the tests with run_tests and confirm they pass.'
+  solution: "When the goal lists numbered requirements, address EVERY one before\n\
+    giving a final answer. Common miss: a goal of the form\n\"1. write code; 2. write\
+    \ tests; 3. run tests\" gets steps 1-2 done and\nthe agent stops. Run-tests is\
+    \ required when the goal says \"run tests\"\nor \"verify they pass\".\n\nWRONG\
+    \ (declaring done after partial coverage):\n\n    Goal: 1. bookmark.py 2. storage.py\
+    \ 3. cli.py 4. test_bookmarks.py 5. run tests\n    write_file(bookmark.py)\n \
+    \   write_file(storage.py)\n    write_file(cli.py)\n    [final answer] \"Files\
+    \ created.\"\n    -> 2 of 5 requirements skipped (test file, test run)\n\nRIGHT\
+    \ (every numbered item addressed):\n\n    write_file(bookmark.py)\n    write_file(storage.py)\n\
+    \    write_file(cli.py)\n    write_file(test_bookmarks.py)\n    run_tests(path=\"\
+    .\", runner=\"pytest\")\n    [final answer] \"All 5 requirements addressed; tests\
+    \ pass.\"\n\nBuild an internal checklist from the goal's numbered items. Tick\
+    \ each\noff before the final answer. If you skipped one, go back and do it\nbefore\
+    \ declaring done.\n"
+  tags:
+  - completeness
+  - numbered_requirements
+  - agentic
+  difficulty: medium
+  source: auto-generated from failure_flagger
+  captured_at: 1777222496.0130384
+  triggering_file: ''
+  suggested_fix_summary: 'The goal listed N numbered requirements but the run finished
+    with significantly fewer mutating tool calls. Re-read the goal and address EVERY
+    numbered item before declaring complete. Common miss: the goal asks to (1) write
+    code, (2) write tests, (3) run tests — agent does (1) and stops. Run tests is
+    required when the goal mentions ''run tests'' or ''verify they pass''.'

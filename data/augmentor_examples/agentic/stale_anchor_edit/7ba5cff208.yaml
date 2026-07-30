@@ -1,0 +1,39 @@
+domain: agentic
+category: reread_before_edit_when_anchor_stale
+examples:
+- query: 'Fix three bugs in this project. (1) storage.py redefines the Bookmark class
+    as a regular class with __init__ — instead it should import Bookmark from bookmark.py
+    and use that dataclass. Remove the duplicate class definition in storage.py. (2)
+    cli.py defines a function named list() which shadows the Python builtin — rename
+    it to list_bookmarks(). Update the set_defaults(func=...) line accordingly. (3)
+    cli.py at the bottom parses args but never dispatches to the handler — add an
+    args.func(args) call after parse_args, and update each handler signature to take
+    an args argument and read fields from it (e.g. add(args) -> args.url, args.title).'
+  solution: "When edit_file fails with `old_string not found`, the file's current\n\
+    content no longer matches your old_string. The fix is to re-read first.\n\nWRONG\
+    \ (relying on stale knowledge of file contents):\n\n    <tool_call>{\"name\":\
+    \ \"edit_file\", \"arguments\": {\"path\": \"x.py\",\n      \"old_string\": \"\
+    def old_form():\", \"new_string\": \"...\"}}</tool_call>\n    -> err: old_string\
+    \ not found in x.py\n    <tool_call>{\"name\": \"edit_file\", \"arguments\": {\"\
+    path\": \"x.py\",\n      \"old_string\": \"def old_form():\", \"new_string\":\
+    \ \"...\"}}</tool_call>\n    -> err: stuck_repeat\n\nRIGHT (re-read first, then\
+    \ build old_string from current content):\n\n    <tool_call>{\"name\": \"read_file\"\
+    , \"arguments\": {\"path\": \"x.py\"}}</tool_call>\n    -> [shows current contents]\n\
+    \    <tool_call>{\"name\": \"edit_file\", \"arguments\": {\"path\": \"x.py\",\n\
+    \      \"old_string\": \"<short unique substring from CURRENT content>\",\n  \
+    \    \"new_string\": \"...\"}}</tool_call>\n\nPick a SHORT unique anchor — usually\
+    \ 1 line of code is enough. Strip\nleading/trailing whitespace from old_string;\
+    \ whitespace must match\nEXACTLY (tabs vs spaces).\n"
+  tags:
+  - edit_file
+  - stale_anchor
+  - read_file
+  - agentic
+  difficulty: medium
+  source: auto-generated from failure_flagger
+  captured_at: 1777222689.5854015
+  triggering_file: cli.py
+  suggested_fix_summary: edit_file's `old_string` doesn't match because the file changed
+    since you last read it. Re-read the file with read_file to see its CURRENT state,
+    then build old_string from the actual current content (a SHORT unique substring
+    works best).

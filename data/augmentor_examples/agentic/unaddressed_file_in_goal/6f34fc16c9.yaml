@@ -1,0 +1,46 @@
+domain: agentic
+category: touch_every_file_named_in_goal
+examples:
+- query: 'Build a minimal todo list CLI from scratch in the current directory. Requirements:
+
+    1. todo.py — Todo dataclass (id: int, title: str, done: bool default False).
+
+    2. storage.py — load_todos(path) and save_todos(path, todos) using JSON.
+
+    3. cli.py — argparse subcommands: add TITLE, list, done ID, clear. Uses todos.json.
+
+    4. test_todo.py — pytest tests for Todo creation, save/load round-trip.
+
+    5. Run the tests with run_tests (pytest) and confirm they pass.
+
+    6. Run ''python cli.py add buy-milk'' and ''python cli.py list'' via run_bash.
+    If stderr shows a SyntaxError or Traceback, fix and retry before declaring done.'
+  solution: "When the goal names specific files, EVERY named file must appear as a\n\
+    mutating tool_call path before you give a final answer. The 14B's\ncommon failure:\
+    \ fixate on one file and silently skip the others.\n\nWRONG (goal said both files;\
+    \ only edited one):\n\n    Goal: \"Fix bug in storage.py and bug in cli.py\"\n\
+    \    edit_file(path=\"cli.py\", ...)   # one fix\n    edit_file(path=\"cli.py\"\
+    , ...)   # second fix in cli.py\n    edit_file(path=\"cli.py\", ...)   # third\
+    \ fix in cli.py\n    [final answer] \"Bugs fixed.\"\n    -> storage.py never touched.\
+    \ Goal half-done.\n\nRIGHT (every named file gets a write or edit):\n\n    edit_file(path=\"\
+    storage.py\", ...)   # storage.py addressed\n    edit_file(path=\"cli.py\", ...)\
+    \       # cli.py addressed\n    [final answer] \"Both bugs fixed.\"\n\nBuild a\
+    \ mental list at the start of every multi-file goal:\n  files_named = [\"storage.py\"\
+    , \"cli.py\"]\n  files_touched = []\nAfter each tool_call, append to files_touched.\
+    \ Don't give a final\nanswer until files_named is a subset of files_touched.\n\
+    \nNote: files mentioned in \"DO NOT modify X\" / \"do not edit X\" don't\ncount\
+    \ — those are the files you should NOT touch.\n"
+  tags:
+  - multi_file
+  - coverage
+  - agentic
+  - completion
+  difficulty: medium
+  source: auto-generated from failure_flagger
+  captured_at: 1777497785.0878112
+  triggering_file: ''
+  suggested_fix_summary: Goal explicitly named multiple files (e.g. 'storage.py and
+    cli.py') but you only edited some of them. Model fixated on one file and skipped
+    the other(s). Before declaring done, list every file the goal named and confirm
+    each was actually written or edited. If the goal says 'fix storage.py and cli.py',
+    BOTH must show up in your tool_call paths.

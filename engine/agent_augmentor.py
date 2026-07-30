@@ -54,6 +54,8 @@ _AGENT_AUGMENTOR_CATEGORIES = [
             "sniffer", "scanner",
             # Reporting verbs
             "findings report", "pcap analysis",
+            "normalize severity", "security findings", "scan findings",
+            "vulnerability report", "pentest report", "cvss",
             # Webapp pentest (added 2026-05-10)
             "intercepting proxy", "http proxy", "burp",
             "jwt", "json web token",

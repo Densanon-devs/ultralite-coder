@@ -1,0 +1,32 @@
+domain: agentic
+category: check_stderr_before_declaring_done
+examples:
+- query: 'Build a small timer module in this directory with a test file, then
+    run the tests and confirm they pass. Files: (1) timer.py with a Timer class
+    exposing start/stop/elapsed, (2) tests/test_timer.py covering a normal run
+    and a stop-before-start error case. Run the suite when you are done and
+    report the result.'
+  solution: "Before emitting a final plain-text answer, scan the LAST run_bash or\n\
+    run_tests result for failure signatures: `Traceback`, `SyntaxError`,\n`AssertionError`,\
+    \ non-zero exit codes, or empty stdout when output was\nexpected. If ANY are present,\
+    \ the task is not done.\n\nWRONG — bailing despite stderr Traceback:\n\n    [run_bash\
+    \ result] stderr: Traceback (most recent call last): ...\n    [final answer] \
+    \   \"Task complete. CLI works as expected.\"\n\nRIGHT — read the traceback, identify\
+    \ the broken line, fix and re-run:\n\n    [run_bash result] stderr: Traceback\
+    \ ... NameError: name 'X' is not\n                              defined\n    [next\
+    \ tool_call]  edit_file to fix the import or definition\n    [next tool_call]\
+    \  re-run the same command\n    [final answer]    only after the re-run shows\
+    \ no error\n\nA final answer is a CLAIM that you've verified the deliverable.\
+    \ Never\nmake that claim while the most recent observation contains an error.\n"
+  tags:
+  - stderr
+  - verification
+  - completion-check
+  - agentic
+  difficulty: medium
+  source: auto-generated from failure_flagger
+  captured_at: 1777262778.4635255
+  triggering_file: ''
+  suggested_fix_summary: Re-read the failing file or re-run the failing command before
+    claiming completion. A final answer is only correct when the most recent tool
+    result was clean — no Traceback, no SyntaxError, no AssertionError.
