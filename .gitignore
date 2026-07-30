@@ -15,14 +15,22 @@ env/
 # Models (large binary files — download separately)
 models/*.gguf
 
-# Runtime data (generated at runtime)
-data/
+# Runtime data (generated at runtime).
+#
+# NOTE the trailing /* rather than /. Git cannot re-include a path whose parent
+# DIRECTORY is excluded, so the old `data/` pattern silently defeated every
+# negation below it: already-tracked files were fine (tracked files bypass
+# .gitignore), but any NEW file — including an augmentor YAML promoted by the
+# self-improving pipeline — was ignored without a word. `data/*` excludes the
+# contents instead of the directory, which lets the negations actually work.
+data/*
 # But keep augmentor examples and module definitions (checked into repo)
 !data/augmentor_examples/
-!data/augmentor_examples/**
 !data/knowledge/
-!data/knowledge/**
 !data/pattern_graph.yaml
+# Capability catalogs are source, not runtime output — the broker is inert
+# without them (see engine/capability_broker.py).
+!data/capabilities/
 
 # Tuned config (machine-specific)
 tuned_config.json
