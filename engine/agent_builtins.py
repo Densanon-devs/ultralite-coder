@@ -1141,6 +1141,8 @@ def build_default_registry(
     memory: Optional[AgentMemory] = None,
     ask_user_fn: Optional[Callable] = None,
     extended_tools: bool = False,
+    lsp_tools: bool = False,
+    lsp_tool_pack: Optional[list[str]] = None,
     mcp_servers: Optional[list[str]] = None,
     mcp_tool_pack: Optional[list[str]] = None,
     enable_web: bool = False,
@@ -1923,6 +1925,24 @@ def build_default_registry(
     # 97.6% to 85.7% when all 21 tools are registered — the model gets
     # confused by the extra schemas. Only enable for interactive use where
     # the user needs refactoring/git/navigation tools.
+
+    # ── LSP / code-intelligence tools (jedi-backed, opt-in) ──
+    # Modular: failure to import the helper or jedi just no-ops. Removing
+    # engine/agent_lsp.py + the jedi requirement leaves the rest of the
+    # registry untouched.
+    if lsp_tools:
+        try:
+            from engine.agent_lsp import register_lsp_tools, is_available
+            if is_available():
+                # Default tool_pack is None → registers the curated
+                # DEFAULT_LSP_TOOLS (2 tools, keeps the registry under
+                # the 14B regression cliff). Caller can pass
+                # `lsp_tool_pack=["all"]` for the full 4-tool surface
+                # or an explicit list for finer curation.
+                register_lsp_tools(reg, ws.root, tool_pack=lsp_tool_pack)
+        except ImportError:
+            pass
+
     if not extended_tools:
         # MCP-mounted tools fire regardless of extended_tools — they're a
         # separate axis (external server vs. local builtin). Empty list

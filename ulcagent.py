@@ -232,6 +232,28 @@ class ModelManager:
 # ── Agent builder ────────────────────────────────────────────────
 
 
+def _parse_lsp_arg(argv: list[str]) -> tuple[bool, "list[str] | None"]:
+    """Parse `--lsp` / `--lsp=all` / `--lsp=name1,name2` from argv.
+
+    Returns `(enabled, tool_pack)`:
+      - `--lsp` absent → (False, None) — LSP off entirely.
+      - `--lsp` (bare) → (True, None) — caller's None becomes the
+        DEFAULT_LSP_TOOLS subset in register_lsp_tools (2 tools).
+      - `--lsp=all` → (True, ['all']) — register every LSP tool.
+      - `--lsp=name1,name2` → (True, ['name1', 'name2']) — explicit
+        curation; unknown names raise ValueError downstream.
+    """
+    for i, a in enumerate(argv):
+        if a == "--lsp":
+            return True, None
+        if a.startswith("--lsp="):
+            value = a.split("=", 1)[1]
+            if value == "all":
+                return True, ["all"]
+            return True, [s.strip() for s in value.split(",") if s.strip()]
+    return False, None
+
+
 def _parse_mcp_arg(argv: list[str]) -> list[str]:
     """Pull `--mcp <comma-separated-names>` out of argv.
 
@@ -304,6 +326,10 @@ def _build_agent(mgr: ModelManager, workspace: Path):
     # Auto-engage audit logging when workspace is an engagement scaffold
     # (has an audit/ subdir). No-op for ad-hoc workspaces.
     audit = AuditLog.for_workspace(workspace)
+    # `--lsp` (bare) → curated 2-tool default (goto_definition + find_references)
+    # `--lsp=all` → full 4-tool surface (past 14B regression cliff)
+    # `--lsp=name1,name2` → explicit curation
+    lsp_enabled, lsp_pack = _parse_lsp_arg(sys.argv)
     # `--mcp <name1,name2>` opt-in MCP-server mounting. Scaffolded today,
     # raises NotImplementedError if used (see engine/mcp_adapter.py).
     # Default = no MCP, identical behavior to before this scaffold landed.
@@ -378,6 +404,8 @@ def _build_agent(mgr: ModelManager, workspace: Path):
         workspace, memory=memory,
         ask_user_fn=_ask_user,
         extended_tools=extended,
+        lsp_tools=lsp_enabled,
+        lsp_tool_pack=lsp_pack,
         mcp_servers=mcp_servers,
         enable_web=enable_web,
         enable_mission=enable_mission,

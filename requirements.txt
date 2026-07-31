@@ -26,3 +26,7 @@ huggingface-hub>=0.20.0
 
 # Desktop app (optional — falls back to browser if not installed)
 pywebview>=4.0
+
+# Code intelligence (optional — only needed for the --lsp tool set)
+# Pure-Python, in-process. Remove this line + delete engine/agent_lsp.py to fully unwire.
+jedi>=0.19.0
