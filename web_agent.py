@@ -111,6 +111,14 @@ class _State:
             max_tokens_per_turn=int(getattr(bm_cfg, "max_tokens", 1024) or 1024),
             temperature=getattr(bm_cfg, "temperature", 0.1) or 0.1,
             confirm_risky=lambda _call: True,
+            # NOTE: confirm_supply_chain is deliberately NOT wired. This UI has
+            # no prompt channel (the agent runs server-side), so the gate's
+            # fail-closed contract is the right behaviour here: benign commands
+            # assess to zero risks and run normally, while a genuine
+            # fetch-and-execute (curl|sh, output-sourced command) is refused
+            # outright instead of silently approved. Do NOT "fix" this by
+            # passing a lambda that returns True — that defeats the gate the
+            # --yes flag is explicitly forbidden from bypassing.
         )
 
     def run_goal(self, goal: str, continue_session: bool = False) -> dict:

@@ -2200,27 +2200,6 @@ def _run_one(agent, goal: str, continue_session: bool = False, workspace: Path =
 
 # ── Main ─────────────────────────────────────────────────────────
 
-def _maybe_frontdoor(goal: str, workspace: Path):
-    """Opt-in deterministic front-door (default OFF, --frontdoor to enable).
-
-    Routes trivially-mechanical requests (pure rename, add top-level import,
-    format a file, trailing-newline fix, bare empty-file create) AROUND the
-    14B entirely — zero model inference. Returns a FrontDoorMatch on a
-    confident deterministic handling, else None (abstain → normal agent loop
-    runs unchanged). The flag check makes the default path byte-for-byte the
-    legacy path. See engine/deterministic_frontdoor.py."""
-    if "--frontdoor" not in sys.argv:
-        return None
-    try:
-        from engine.deterministic_frontdoor import DeterministicFrontDoor
-        fd = DeterministicFrontDoor(workspace)
-        return fd.try_handle(goal)
-    except Exception:
-        # The front-door must never break the normal flow — any failure
-        # silently defers to the model.
-        return None
-
-
 def main():
     # Readline history
     try:
