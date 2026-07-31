@@ -71,6 +71,10 @@ bench_*.stderr.log
 bench_*.stdout.log
 bench_*_log.txt
 download_*.log
+# A/B harness output (test_gbnf_toolcall_ab.py, benchmark_agentic.py --toolset).
+# Same reasoning as the bench_* artifacts above: evidence for the branch that
+# produced it, not something to carry in history.
+gbnf_*.log
 
 # Diagnostic / probe scripts — _-prefixed at repo root by convention.
 # Throwaway one-shots for verifying a pipeline; not unit tests, not
