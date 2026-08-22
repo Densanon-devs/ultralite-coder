@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "ulcagent": {
+      "command": "python",
+      "args": [
+        "-m", "engine.mcp_workhorse",
+        "--workspace", ".",
+        "--model", "C:/models/qwen2.5-coder-14b-instruct-q4_k_m.gguf"
+      ],
+      "cwd": "D:/LLCWork/ultralight-coder"
+    }
+  }
+}
