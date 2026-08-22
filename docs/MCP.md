@@ -173,6 +173,41 @@ is minutes; from `C:` it is ~8s.
   to stand alone. "Fix the thing we discussed" fails; name the files.
 - **stdout is the protocol.** All logging goes to stderr.
 
+## `no_op`: the failure mode that matters most
+
+The 14B intermittently returns an **empty generation** on turn 1, which
+the agent loop classifies as `stop_reason="answered"`. Left alone, that
+surfaces as a job that did nothing while reporting success — and a
+driver building its next stage on it corrupts the whole pipeline.
+
+Measured 2026-08-22, same task, four phrasings:
+
+| phrasing | result |
+|---|---|
+| "…strips leading and trailing hyphens. **Return the slug.**" | empty generation |
+| same, trailing sentence removed | ✔ `write_file` |
+| "**Use the write_file tool to** create utils.py…" | empty generation |
+| "Create a file hello.txt containing…" | ✔ `write_file` |
+
+It is prompt-*shape* sensitive, not a capability limit — naming the
+tool explicitly made it worse, not better, and the failures reproduce
+deterministically for a given phrasing. This is the same wall as
+`feedback_14b_tool_call_ceilings`: not prompt-fixable in general.
+
+So the server detects it (no tool calls **and** empty answer), retries
+once, and if it happens again reports a distinct terminal status
+`no_op` carrying a hint telling the driver to rephrase. It never
+reports it as `done`.
+
+**Drivers must treat any status that is not `queued`/`running` as
+terminal.** Our own test harness span forever when `no_op` was added
+because it checked `status in ("done","error","cancelled")`. Check
+negatively, not positively.
+
+Rephrasing genuinely recovers — the failing goal above succeeded on the
+plainer wording (`status: done`, `files_changed: ["utils.py"]`, output
+verified correct).
+
 ## Testing
 
 `test_mcp_workhorse.py` (18 tests) drives the `Server` class in-process

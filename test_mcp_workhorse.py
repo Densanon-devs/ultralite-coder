@@ -54,21 +54,34 @@ def _call(srv: Server, name: str, args: dict) -> tuple[bool, str]:
 class _StubWorkhorse(Workhorse):
     """Replaces _execute so no model is loaded."""
 
-    def __init__(self, *a, delay: float = 0.0, boom: bool = False, **kw):
+    def __init__(self, *a, delay: float = 0.0, boom: bool = False,
+                 no_op: bool = False, **kw):
         super().__init__(*a, **kw)
         self.delay = delay
         self.boom = boom
+        self.no_op = no_op
 
     def _execute(self, job: Job):
         time.sleep(self.delay)
         if self.boom:
             raise RuntimeError("simulated model failure")
+        if self.no_op:
+            # What the real 14B does on an empty generation: agent reports
+            # stop_reason "answered" having called nothing and said nothing.
+            job.answer = ""
+            job.stop_reason = "answered"
+            job.iterations = 1
+            job.wall_time = self.delay
+            job.files_changed = []
+            job.tool_calls = []
+            return True
         job.answer = f"did: {job.goal}"
         job.stop_reason = "answered"
         job.iterations = 2
         job.wall_time = self.delay
         job.files_changed = ["stub.py"]
         job.tool_calls = ["read_file", "edit_file"]
+        return False
 
 
 # ── protocol ─────────────────────────────────────────────────────
@@ -182,6 +195,45 @@ def test_model_failure_surfaces_as_error_status_not_silent_success():
         data = json.loads(text)
         assert data["status"] == "error", data
         assert "simulated model failure" in data["error"]
+
+
+def test_empty_generation_is_reported_as_no_op_not_done():
+    """The dangerous failure: model does nothing, harness calls it success.
+
+    Observed live 2026-08-22 — the 14B returned an empty generation and the
+    agent loop classified it stop_reason="answered". A driver that trusts
+    "done" would build its next stage on work that never happened.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        srv = _server(Path(tmp))
+        srv.wh = _StubWorkhorse(Path(tmp), no_op=True)
+        _, text = _call(srv, "delegate", {"goal": "something the model whiffs"})
+        job_id = json.loads(text)["job_id"]
+        _, text = _call(srv, "delegate_result", {"job_id": job_id, "wait_seconds": 30})
+        data = json.loads(text)
+        assert data["status"] == "no_op", data
+        assert data["status"] != "done"
+        assert data["files_changed"] == []
+        assert "NOTHING was done" in data["hint"]
+
+
+def test_no_op_is_terminal_so_polling_does_not_hang():
+    with tempfile.TemporaryDirectory() as tmp:
+        srv = _server(Path(tmp))
+        srv.wh = _StubWorkhorse(Path(tmp), no_op=True)
+        _, text = _call(srv, "delegate", {"goal": "whiff"})
+        job_id = json.loads(text)["job_id"]
+        t0 = time.monotonic()
+        _call(srv, "delegate_result", {"job_id": job_id, "wait_seconds": 20})
+        assert time.monotonic() - t0 < 15, "polling blocked on a terminal no_op"
+
+
+def test_delegate_result_description_warns_about_no_op():
+    """The driver only checks status if the schema tells it to."""
+    with tempfile.TemporaryDirectory() as tmp:
+        srv = _server(Path(tmp))
+        desc = srv.tools["delegate_result"]["description"]
+        assert "no_op" in desc and "NOTHING was done" in desc
 
 
 def test_unknown_job_id_is_an_error():

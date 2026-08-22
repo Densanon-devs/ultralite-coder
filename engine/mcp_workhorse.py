@@ -75,7 +75,10 @@ class Job:
     workspace: str
     toolset: str
     max_iterations: int
-    status: str = "queued"          # queued|running|done|error|cancelled
+    # no_op is terminal and distinct from done: the model returned nothing and
+    # touched nothing. Folding it into "done" would hand the driver a false
+    # success and silently break a multi-stage pipeline.
+    status: str = "queued"          # queued|running|done|no_op|error|cancelled
     answer: str = ""
     stop_reason: str = ""
     iterations: int = 0
@@ -94,7 +97,7 @@ class Job:
             "status": self.status,
             "goal": self.goal[:200],
         }
-        if self.status in ("done", "error"):
+        if self.status in ("done", "no_op", "error"):
             d.update({
                 "answer": self.answer,
                 "stop_reason": self.stop_reason,
@@ -105,6 +108,16 @@ class Job:
             })
             if self.error:
                 d["error"] = self.error
+            if self.status == "no_op":
+                d["hint"] = (
+                    "The local model returned an empty response and called no "
+                    "tools, twice. NOTHING was done — do not treat this as "
+                    "success. This is prompt-shape sensitive on the 14B, not a "
+                    "problem with the request being impossible: rephrase the "
+                    "goal (plainer wording, drop trailing meta-sentences like "
+                    "'Return the X.', avoid naming the tool) and delegate again, "
+                    "or do this stage yourself."
+                )
             if verbose:
                 d["tool_calls"] = self.tool_calls
         elif self.status == "running":
@@ -181,10 +194,10 @@ class Workhorse:
                 job.status = "running"
                 job.started_at = time.monotonic()
             try:
-                self._execute(job)
+                no_op = self._execute(job)
                 with self._lock:
                     if job.status != "cancelled":
-                        job.status = "done"
+                        job.status = "no_op" if no_op else "done"
             except Exception as exc:                     # noqa: BLE001
                 self._log("job failed:\n" + traceback.format_exc())
                 with self._lock:
@@ -220,19 +233,36 @@ class Workhorse:
             # block on a prompt that no human will ever see.
         )
 
-        agent = Agent(
-            model=model,
-            registry=registry,
-            workspace_root=ws,
-            memory=memory,
-            auto_verify_python=True,
-            max_iterations=job.max_iterations,
-            max_wall_time=900.0,
-            temperature=0.1,
-            enable_self_heal=True,
-        )
+        def _once():
+            agent = Agent(
+                model=model,
+                registry=registry,
+                workspace_root=ws,
+                memory=memory,
+                auto_verify_python=True,
+                max_iterations=job.max_iterations,
+                max_wall_time=900.0,
+                temperature=0.1,
+                enable_self_heal=True,
+            )
+            return agent.run(job.goal)
 
-        result = agent.run(job.goal)
+        result = _once()
+
+        # The 14B intermittently returns an EMPTY generation on turn 1 for
+        # certain goal phrasings, which the agent loop then classifies as
+        # stop_reason="answered". Measured 2026-08-22: 2 of 4 phrasings of the
+        # same task no-op'd, and naming the tool explicitly did not help — it
+        # is prompt-shape sensitive, not a capability limit (see
+        # feedback_14b_tool_call_ceilings). Reporting that as success would
+        # hand the driver a false completion, so detect it and retry once
+        # before giving up. Retry is cheap relative to a wrong "done".
+        def _is_no_op(r) -> bool:
+            return not r.tool_calls and not (r.final_answer or "").strip()
+
+        if _is_no_op(result):
+            self._log(f"job {job.job_id}: empty generation, retrying once")
+            result = _once()
 
         changed: list[str] = []
         calls: list[str] = []
@@ -254,6 +284,8 @@ class Workhorse:
             job.est_tokens = getattr(result, "est_tokens", 0)
             job.files_changed = changed
             job.tool_calls = calls
+
+        return _is_no_op(result)
 
     # ── public API ───────────────────────────────────────────────
 
@@ -350,7 +382,11 @@ def _tools(wh: "Workhorse") -> dict[str, dict[str, Any]]:
             "description": (
                 "Fetch a delegated job's status/result by job_id. Optionally block "
                 "up to wait_seconds for it to finish. Jobs run one at a time (single "
-                "local GPU), so a job may sit 'queued' behind another."
+                "local GPU), so a job may sit 'queued' behind another. "
+                "ALWAYS check status: 'done' did the work; 'no_op' means the local "
+                "model returned nothing and NOTHING was done (rephrase and retry, or "
+                "do it yourself); 'error' means it crashed. Verify files_changed "
+                "matches what you expected before building on the result."
             ),
             "schema": {
                 "type": "object",
