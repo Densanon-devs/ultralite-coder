@@ -56,7 +56,9 @@ ultralight-coder/
 │   ├── augmentor_promoter.py   # Harvest pipeline: review → retrieval index, with dedup
 │   ├── trajectory_distiller.py # Harvest pipeline: successful runs → trajectories
 │   ├── library_status.py       # Harvest pipeline: 4-bucket status (backs /library)
-│   ├── mcp_adapter.py          # MCP-client scaffold (interface only — see docs/MCP.md)
+│   ├── mcp_adapter.py          # MCP-CLIENT scaffold (interface only — see docs/MCP.md)
+│   ├── mcp_server.py           # MCP SERVER for DensAssistant — exposes file primitives
+│   ├── mcp_workhorse.py        # MCP SERVER for Claude Code — exposes the AGENT LOOP (delegate/poll)
 │   ├── classifier.py            # Neural classifier for routing
 │   └── speculative.py           # Speculative decoding
 ├── modules/                     # Task-specific modules (YAML manifests)
@@ -367,6 +369,37 @@ Tests live in tests/ and use pytest. Always run tests after code changes.
 ```
 
 When ulcagent starts in a directory containing `.ulcagent`, it reads the file automatically. Instructions appear in the agent's system prompt; aliases appear alongside the built-in slash commands.
+
+### Being driven: ulcagent as a workhorse (engine/mcp_workhorse.py)
+
+Registered at Claude Code **user scope**, so it is available from every project:
+
+```bash
+python D:/LLCWork/ultralight-coder/run_mcp_workhorse.py --model C:/models/qwen2.5-coder-14b-instruct-q4_k_m.gguf
+```
+
+A strong driver plans and reviews; this 14B does the mechanical work. Four
+tools — `delegate` / `delegate_result` / `delegate_list` / `delegate_cancel` —
+and deliberately **no file primitives**: Claude Code already has stronger ones,
+and extra schemas are a context tax on the driver too (same reasoning as the
+tool-count regression above). `run_mcp_workhorse.py` is an absolute-path
+launcher (`claude mcp add` has no `cwd` option) that leaves cwd alone so
+`--workspace` defaults to the project being worked on.
+
+**Non-obvious behaviour, all load-bearing:**
+- `delegate` returns a job id instantly and never blocks.
+- Jobs run **one at a time** (one GGUF, one GPU); a second call queues.
+- A running job **cannot** be cancelled — no cooperative cancellation point.
+- Writes are **allowlist-gated only** (`engine/write_policy.py`); no confirm
+  hook exists on an unattended path. `ulcagent --revert-last N` is the undo.
+- **`no_op`** is a terminal status distinct from `done`: the 14B intermittently
+  returns an *empty generation* that the agent loop calls `answered`, so the
+  server retries once and then reports `no_op` rather than a false success.
+  Prompt-*shape* sensitive — measured 2 of 4 phrasings of the same task, and
+  naming the tool explicitly made it worse. Rephrasing recovers.
+- Drivers must treat any status other than `queued`/`running` as terminal.
+
+Tests: `test_mcp_workhorse.py` (21). Full detail: `docs/MCP.md`.
 
 ### Web UI (web_agent.py)
 - Browser-based chat at localhost:8899
